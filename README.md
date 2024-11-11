@@ -7,7 +7,7 @@ Esses são os conteúdos presentes neste repositório:
 
 2) "[refino] sobrepreço.R" - Replica os modelos da análise de sobrepreço; 
 
-3) "[refino] dados" - Dados de preço e outras variáveis usadas na precificação no setor.
+3) "[refino] dados" - Dados de preço e outras variáveis usadas na precificação do setor.
 
 Créditos e agradecimentos a:
   Fernado Franke - Coordenador da CECAN (Coordenação de Estudos de Condutas Anticompetitivas)

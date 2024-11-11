@@ -9,3 +9,6 @@ Esses são os conteúdos presentes neste repositório:
 
 3) "[refino] dados" - Dados de preço e outras variáveis usadas na precificação no setor.
 
+Créditos e agradecimentos a:
+  Fernado Franke - Coordenador da CECAN (Coordenação de Estudos de Condutas Anticompetitivas)
+  João Isídio Freitas Martins - Economista da CECAN 

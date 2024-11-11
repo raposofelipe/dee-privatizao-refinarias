@@ -1,0 +1,2161 @@
+---
+title: "Análise de sobrepreço pós-privatização"
+author: "DEE - CECAN"
+date: 'Última versão: 03/09/2024'
+output:
+  html_document:
+    df_print: paged
+---
+
+Este presente arquivo se concentra em estudar o impacto que a privatização das refinarias REAM e ACELEN/RELAM tiveram em suas políticas de preço à distribuidoras. Antes de mais nada, é válido ressaltar que esse diz respeito somente ao elo intermediário da cadeia produtiva de combustíveis, não buscamos discorrer sobre o impacto que a desintegração vertical teria no comportamento de outros agentes ou no bem-estar dos consumidores. 
+
+Assim, ele se divide em duas partes:
+  Seção 1 - Leitura
+  Seção 2 - Efeito da privatização
+  Seção 3 - Análise Exploratória
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(did2s)
+library(stargazer)
+library(etwfe)
+library(marginaleffects)
+library(huxtable) # tabela biita
+library(RColorBrewer)
+library(Polychrome)
+```
+
+
+
+# 1 Dados
+
+## 1.1 Bases
+
+```{r message=FALSE, warning=FALSE}
+# coordenadas dos municípios brasileiros
+brasil <- geobr::read_municipality(year = 2022, showProgress = FALSE) %>%
+  dplyr::select(code_muni, name_muni, geom, abbrev_state)
+```
+
+### 1.1.1 Gasolina A
+
+```{r message=FALSE, warning=FALSE}
+for (ref in c("petrobras", "acelen", "ream")) {
+  # base dos preços EM LISTA das refinarias 
+  # bom lembrar, preço em lista não é o comercializado com as distribuidoras, é uma referência dele 
+  refinaria <- readRDS(file = "S:/CECAN/Felipe Raposo/Refino/Bases/preco_combustiveis_mensal.rds") %>% 
+    rename(cidade = Cidade) %>% 
+    filter(produto == "gasolina", 
+           refinaria == ref
+           ) %>% 
+    mutate(date = as.Date(date))
+  
+  # identificação municipal
+  # localização dos locais de venda
+  refinaria <- brasil %>% 
+    left_join(refinaria, by = c("code_muni" = "code_cidade"))%>%  
+    group_by(ano, mes) %>%
+    arrange(.by_group = TRUE) %>% 
+    filter(!is.na(preco)) %>% 
+    mutate(code_muni = as.character(code_muni))
+  
+  # base do PPI (média mensal) 
+  ppi <- readxl::read_excel("S:/CECAN/Felipe Raposo/Refino/Bases/ppi.xlsx", sheet = 1, range = "B3:R304") %>% 
+    mutate(Data = str_to_lower(Data),
+           inicio_semana = as.Date(str_extract(Data, "\\d{2}/\\d{2}/\\d{4}"), format = "%d/%m/%Y"),
+           fim_semana = as.Date(str_extract(Data, "(?<= a )\\d{2}/\\d{2}/\\d{4}"), format = "%d/%m/%Y"),
+           mes = substr(fim_semana, 6, 7),
+           ano = substr(fim_semana, 1, 4)) %>% 
+    select(inicio_semana, fim_semana, ano, mes, everything(), -Data) %>%
+    pivot_longer(-c(1:4), names_to = "cidade", values_to = "preco_ppi") %>% 
+    group_by(ano, mes, cidade) %>% 
+    # tirando a média mensal dos preços 
+    summarise(preco_ppi = mean(preco_ppi, na.rm = F), .groups = "drop") %>%
+    mutate(date = as.Date(paste(ano, mes, "01", sep = "-")),
+           # alguns portos foram colocados, Paranaguá teve acento faltando
+           cidade = case_when(
+             cidade == "Tramandai" ~ "Tramandaí",
+             cidade == "Suape" ~ "Ipojuca",
+             cidade == "Aratu" ~ "Candeias",
+             cidade == "Paranagua" ~ "Paranaguá",
+             .default = cidade
+           ),
+           cidade = str_to_title(cidade)
+           )
+  
+  # identificação municipal
+  ppi <- ppi %>% 
+    select(date, everything()) %>% 
+    left_join(
+      (geobr::read_municipality(showProgress = FALSE) %>% 
+         select(name_muni, code_state, abbrev_state, everything()) %>% 
+         mutate(name_muni = str_to_title(name_muni),
+                abbrev_state = case_when(
+                  # dizendo qual que é a Candeias que eu quero
+                  name_muni == "Candeias" & abbrev_state == "MG" ~ NA, 
+                  .default = abbrev_state)) %>% 
+         filter(!is.na(abbrev_state))), join_by(cidade == name_muni)
+    ) %>% 
+    filter(!is.na(preco_ppi), 
+           date >= min(refinaria$date))
+  
+  spatial_ppi <- brasil %>% 
+    filter(code_muni %in% ppi$code_muni) %>% 
+    arrange(code_muni)
+
+  spatial_refinaria <- brasil %>% 
+    filter(code_muni %in% refinaria$code_muni) %>% 
+    mutate(mesmo = if_else(
+      code_muni %in% c(spatial_ppi$code_muni), 1, 0
+    )) %>% 
+    arrange(desc(mesmo))
+
+  # distancia entre os centroides de cada ponto
+  distancia <- sf::st_distance(spatial_ppi, spatial_refinaria) %>% 
+    as.data.frame() %>% 
+    `colnames<-`(spatial_refinaria$code_muni) %>% 
+    rownames_to_column("code_ppi") %>% 
+    mutate(code_ppi = spatial_ppi$code_muni) %>% 
+    pivot_longer(-1, names_to = "code_refinaria", values_to = "distancia") %>% 
+    mutate(distancia = as.numeric(distancia), 
+           mesmo = if_else(code_ppi == code_refinaria, 1, 0), 
+           pseudo = if_else(code_ppi != code_refinaria & distancia == 0, 1, 0))
+  
+  refinaria_distancia <- refinaria %>% 
+    as.data.frame() %>% 
+    # pegando todas as relações de distância NO TEMPO
+    left_join(distancia, by = c("code_muni" = "code_refinaria"), relationship = "many-to-many") %>% 
+    select(date, cidade,  abbrev_state, code_muni, code_ppi, distancia, preco, modalidade,) %>% 
+    rename(code_refinaria = code_muni) %>% 
+    group_by(cidade, date, modalidade) %>% 
+    filter(distancia == min(distancia)) %>% 
+    mutate(distancia = if_else(
+      n() > 1 & code_ppi != code_refinaria, NA, distancia)) %>% 
+    filter(!is.na(distancia)) %>% 
+    ungroup()
+  
+  refinaria <- ppi %>% as_tibble() %>% 
+    rename(code_ppi = code_muni, 
+           cidade_ppi = cidade) %>%
+    select(date, code_ppi, cidade_ppi, preco_ppi) %>% 
+    right_join(refinaria_distancia, by = c("date", "code_ppi")) %>% 
+    mutate(refinaria = ref, 
+           produto = "gasolina") %>% 
+    select(date, cidade_ppi, code_ppi, cidade, cidade, abbrev_state, 
+           distancia, refinaria, produto, preco_ppi, preco, modalidade )
+  
+  if(ref == "petrobras"){
+    gas <- refinaria %>% 
+      arrange(date)
+  } else{
+    gas <- gas %>% rbind(refinaria) %>% 
+      arrange(date)
+  }
+  
+}
+
+gas <- gas %>% 
+  mutate(produto = "gasolina")
+
+rm(list = ls()[!ls() %in% c("brasil", "gas")])
+```
+
+### 1.1.2 Diesel S10
+
+```{r message=FALSE, warning=FALSE}
+for (ref in c("petrobras", "acelen", "ream")) {
+  # base dos preços EM LISTA das refinarias 
+  # bom lembrar, preço em lista não é o comercializado com as distribuidoras, é uma referência dele 
+  refinaria <- readRDS(file = "S:/CECAN/Felipe Raposo/Refino/Bases/preco_combustiveis_mensal.rds") %>% 
+    rename(cidade = Cidade) %>% 
+    filter(produto == "diesel_s10", 
+           refinaria == ref
+           ) %>% 
+    mutate(date = as.Date(date))
+  
+  # identificação municipal
+  # localização dos locais de venda
+  refinaria <- brasil %>% 
+    left_join(refinaria, by = c("code_muni" = "code_cidade"))%>%  
+    group_by(ano, mes) %>%
+    arrange(.by_group = TRUE) %>% 
+    filter(!is.na(preco)) %>% 
+    mutate(code_muni = as.character(code_muni))
+  
+  # base do PPI (média mensal) 
+  ppi <- readxl::read_excel("S:/CECAN/Felipe Raposo/Refino/Bases/ppi.xlsx", sheet = 2, range = "B3:R304") %>% 
+    mutate(Data = str_to_lower(Data),
+           inicio_semana = as.Date(str_extract(Data, "\\d{2}/\\d{2}/\\d{4}"), format = "%d/%m/%Y"),
+           fim_semana = as.Date(str_extract(Data, "(?<= a )\\d{2}/\\d{2}/\\d{4}"), format = "%d/%m/%Y"),
+           mes = substr(fim_semana, 6, 7),
+           ano = substr(fim_semana, 1, 4)) %>% 
+    select(inicio_semana, fim_semana, ano, mes, everything(), -Data) %>%
+    pivot_longer(-c(1:4), names_to = "cidade", values_to = "preco_ppi") %>% 
+    group_by(ano, mes, cidade) %>% 
+    # tirando a média mensal dos preços 
+    summarise(preco_ppi = mean(preco_ppi, na.rm = F), .groups = "drop") %>%
+    mutate(date = as.Date(paste(ano, mes, "01", sep = "-")),
+           # alguns portos foram colocados, Paranaguá teve acento faltando
+           cidade = case_when(
+             cidade == "Tramandai" ~ "Tramandaí",
+             cidade == "Suape" ~ "Ipojuca",
+             cidade == "Aratu" ~ "Candeias",
+             cidade == "Paranagua" ~ "Paranaguá",
+             .default = cidade
+           ),
+           cidade = str_to_title(cidade)
+           )
+  
+  # identificação municipal
+  ppi <- ppi %>% 
+    select(date, everything()) %>% 
+    left_join(
+      (geobr::read_municipality(showProgress = FALSE) %>% 
+         select(name_muni, code_state, abbrev_state, everything()) %>% 
+         mutate(name_muni = str_to_title(name_muni),
+                abbrev_state = case_when(
+                  # dizendo qual que é a Candeias que eu quero
+                  name_muni == "Candeias" & abbrev_state == "MG" ~ NA, 
+                  .default = abbrev_state)) %>% 
+         filter(!is.na(abbrev_state))), join_by(cidade == name_muni)
+    ) %>% 
+    filter(!is.na(preco_ppi), 
+           date >= min(refinaria$date))
+  
+  spatial_ppi <- brasil %>% 
+    filter(code_muni %in% ppi$code_muni) %>% 
+    arrange(code_muni)
+
+  spatial_refinaria <- brasil %>% 
+    filter(code_muni %in% refinaria$code_muni) %>% 
+    mutate(mesmo = if_else(
+      code_muni %in% c(spatial_ppi$code_muni), 1, 0
+    )) %>% 
+    arrange(desc(mesmo))
+
+  # distancia entre os centroides de cada ponto
+  distancia <- sf::st_distance(spatial_ppi, spatial_refinaria) %>% 
+    as.data.frame() %>% 
+    `colnames<-`(spatial_refinaria$code_muni) %>% 
+    rownames_to_column("code_ppi") %>% 
+    mutate(code_ppi = spatial_ppi$code_muni) %>% 
+    pivot_longer(-1, names_to = "code_refinaria", values_to = "distancia") %>% 
+    mutate(distancia = as.numeric(distancia), 
+           mesmo = if_else(code_ppi == code_refinaria, 1, 0), 
+           pseudo = if_else(code_ppi != code_refinaria & distancia == 0, 1, 0))
+  
+  refinaria_distancia <- refinaria %>% 
+    as.data.frame() %>% 
+    # pegando todas as relações de distância NO TEMPO
+    left_join(distancia, by = c("code_muni" = "code_refinaria"), relationship = "many-to-many") %>% 
+    select(date, cidade,  abbrev_state, code_muni, code_ppi, distancia, preco, modalidade) %>% 
+    rename(code_refinaria = code_muni) %>% 
+    group_by(cidade, date, modalidade) %>% 
+    filter(distancia == min(distancia)) %>% 
+    mutate(distancia = if_else(
+      n() > 1 & code_ppi != code_refinaria, NA, distancia)) %>% 
+    filter(!is.na(distancia)) %>% 
+    ungroup()
+  
+  refinaria <- ppi %>% as_tibble() %>% 
+    rename(code_ppi = code_muni, 
+           cidade_ppi = cidade) %>%
+    select(date, code_ppi, cidade_ppi, preco_ppi) %>% 
+    right_join(refinaria_distancia, by = c("date", "code_ppi")) %>% 
+    mutate(refinaria = ref, 
+           produto = "diesel_s10") %>% 
+    select(date, cidade_ppi, code_ppi, cidade, abbrev_state, 
+           distancia, refinaria, produto, preco_ppi, preco, modalidade)
+  
+  if(ref == "petrobras"){
+    diesel <- refinaria %>% 
+      arrange(date)
+  } else{
+    diesel <- diesel %>% rbind(refinaria) %>%
+      arrange(date)
+  }
+  
+}
+
+diesel <- diesel %>% 
+  mutate(produto = "diesel_s10")
+```
+
+Temos dois tipos de "problemas": 
+  1. cidades SEMPRE tratadas
+  2. cidades NUNCA tratadas (até aqui tá show) mas atrasadas (isso é realmente um problema?)
+  
+```{r}
+gas_problema <- gas %>% 
+  filter(!is.na(preco)) %>% group_by(cidade, refinaria) %>%  
+  summarise(min_date = min(date), .groups = "drop") %>% 
+  pivot_wider(names_from = refinaria, values_from = min_date) %>% 
+  mutate(problema = case_when(condition = 
+                              # sempre tratadas
+                              is.na(petrobras) & !is.na(acelen) ~ T, 
+                              # NUNCA tratadas mas muito atrasadas
+                              as.Date(petrobras) > as.Date("2021-12-01") ~ T, 
+                              .default = F)) %>% 
+  filter(problema == T) %>% rename(cidade_problema = cidade)
+
+diesel_problema <- diesel %>% 
+  filter(!is.na(preco)) %>% group_by(cidade, refinaria) %>%  
+  summarise(min_date = min(date), .groups = "drop") %>% 
+  pivot_wider(names_from = refinaria, values_from = min_date) %>% 
+  mutate(problema = case_when(condition = 
+                              # sempre tratadas
+                              is.na(petrobras) & !is.na(acelen) ~ T, 
+                              # NUNCA tratadas mas muito atrasadas
+                              as.Date(petrobras) > as.Date("2021-12-01") ~ T, 
+                              .default = F)) %>% 
+  filter(problema == T) %>% rename(cidade_problema = cidade)
+
+diesel_problema
+gas_problema
+```
+
+```{r}
+gas <- gas %>% filter(!(cidade %in% gas_problema$cidade_problema))
+diesel <- diesel %>% filter(!(cidade %in% diesel_problema$cidade_problema))
+
+df_combustivel <- gas %>% rbind(diesel) %>% 
+  arrange(date) %>% 
+  left_join(
+    brasil %>% as_tibble() %>% select(code_muni, name_muni, abbrev_state), 
+    by = c("cidade" = "name_muni", "abbrev_state" = "abbrev_state")) %>%
+  select(date, cidade, code_muni, abbrev_state, cidade_ppi, code_ppi, everything())
+
+# preço deflacionado
+df_combustivel$preco <- deflateBR::ipca(df_combustivel$preco, df_combustivel$date, "07/2024")
+df_combustivel$preco_ppi <- deflateBR::ipca(df_combustivel$preco_ppi, df_combustivel$date, "07/2024")
+```
+
+```{r}
+rm(list = ls()[!ls() %in% c("brasil","gas", "diesel", "df_combustivel")])
+```
+
+# 2 Privatização 
+
+## 2.1 Identificação do tratamento 
+
+```{r}
+# Uma unidade ser tratada significa que NAQUELA DATA e NAQUELA CIDADE a acelen opera
+# aqui, a unidade que indica um pré estágio de tratamento será priv
+
+df_combustivel <- df_combustivel %>% 
+  mutate(priv = if_else(refinaria == "petrobras", 0, 1),
+         priv = as.numeric(priv)) %>% 
+  filter(!is.na(preco_ppi),
+         date > "2019-08-01",
+         date < "2024-08-01")
+
+# conjunto de cidades que um dia serão tratadas
+cidades_tratadas <- df_combustivel %>% 
+  filter(priv == 1) %>% 
+  group_by(cidade) %>% summarise()
+
+cidades_acelen <- df_combustivel %>% 
+  filter(refinaria == "acelen") %>% 
+  reframe(.by = cidade)
+
+# já adiantando, um coorte é sobre QUANDO uma cidade ou um grupo delas COMEÇA a receber esse tratamento
+# dessa forma, uma cidade PRECISA não ter tido acelen p/ entrar na análise, ela NÃO pode 
+# entrar na base sem ter passado por um período que a acelen não atuava na região 
+id_coorte <- df_combustivel %>% 
+  group_by(cidade, produto) %>%
+  filter(priv == 1) %>%
+  summarise(coorte = min(date), .groups = "drop")
+
+df_combustivel <- df_combustivel %>%
+  left_join(id_coorte, by = c("cidade","produto")) %>% 
+  mutate(coorte = ifelse(is.na(coorte), 0, coorte)) %>% ungroup()
+```
+
+```{r}
+# aqui, construiremos uma nova base: uma em que TODAS as observações são mantidas
+# entretanto, o tratamento agora é REALMENTE identificado por cidade, ou seja, 
+# trat recebe 1 caso a cidade em questão receba algo das privatizadas
+
+combustivel_cidade <- df_combustivel %>% 
+  group_by(produto, cidade, date) %>% 
+  mutate(
+    trat = if_else(sum(priv) > 0, 1, 0)
+    )
+  
+# distância em meses 
+
+combustivel_cidade <- combustivel_cidade %>% 
+  mutate(coorte = as.Date(coorte),
+         tempo_priv = case_when(
+           coorte == 0 ~ -Inf,
+           coorte != 0 ~ time_length(interval(coorte, date), unit = "months"))
+         )  %>% ungroup()
+```
+
+
+### 2.1.1 Clássico
+
+```{r}
+# ream
+## sem ppi
+### trat
+mqo_diesel_r_sem <- lm(preco ~ trat + factor(cidade) + factor(date), 
+   data = combustivel_cidade %>% filter(produto == "diesel_s10",
+                                        !(cidade %in% cidades_acelen$cidade)))
+
+mqo_gas_r_sem <- lm(preco ~ trat + factor(cidade) + factor(date), 
+   data = combustivel_cidade %>% filter(produto == "gasolina",
+                                        !(cidade %in% cidades_acelen$cidade)))
+
+## com ppi
+### trat
+mqo_diesel_r_com <- lm(preco ~ trat + preco_ppi + factor(cidade) + factor(date), 
+   data = combustivel_cidade %>% filter(produto == "diesel_s10",
+                                        !(cidade %in% cidades_acelen$cidade)))
+
+mqo_gas_r_com <- lm(preco ~ trat + preco_ppi + factor(cidade) + factor(date), 
+   data = combustivel_cidade %>% filter(produto == "gasolina",
+                                        !(cidade %in% cidades_acelen$cidade)))
+```
+
+```{r}
+# acelen
+## sem ppi
+### trat
+mqo_diesel_a_sem <- lm(preco ~ trat + factor(cidade) + factor(date), 
+   data = combustivel_cidade %>% filter(produto == "diesel_s10",
+                                        cidade != "Manaus"))
+
+mqo_gas_a_sem <- lm(preco ~ trat + factor(cidade) + factor(date), 
+   data = combustivel_cidade %>% filter(produto == "gasolina",
+                                        cidade != "Manaus"))
+## com ppi
+### trat
+mqo_diesel_a_com <- lm(preco ~ trat + preco_ppi + factor(cidade) + factor(date), 
+   data = combustivel_cidade %>% filter(produto == "diesel_s10",
+                                        cidade != "Manaus"))
+
+mqo_gas_a_com <- lm(preco ~ trat + preco_ppi + factor(cidade) + factor(date), 
+   data = combustivel_cidade %>% filter(produto == "gasolina",
+                                        cidade != "Manaus"))
+```
+
+## 2.2 DID2S
+
+
+Two-Stage Difference-in-Differences, Gardner (2021)
+
+aplicação:  https://jrgcmu.github.io/2sdd_current.pdf (2022)
+            https://journal.r-project.org/articles/RJ-2022-048/ (2021)
+
+"In this framework, group and period effects are identified in a first stage from the sample of untreated observations, and average treatment effects are identified in a second stage by comparing treated and untreated outcomes, after removing these group and period effects" (Gardner, 2021)
+
+"The goal (...) is to estimate TWFE models without running into the problem of staggered treatment adoption" (2022)
+
+
+#### 2.2.1 Estático
+
+```{r}
+# ream
+# sem ppi
+## trat
+did2s_diesel_r_sem <- 
+  did2s::did2s(data = combustivel_cidade %>% filter(produto == "diesel_s10", 
+                                                    !(cidade %in% cidades_acelen$cidade)),
+        yname = "preco",
+        treatment = "trat",
+        # primeiro estágio: (preco_it) = α_i + λ_t +ε_it + γ preco_brent_it
+        # retira a média de cada cidade em cada período de tempo, i.e, centraliza e foca no resíduo
+        # ajuda a isolar o que não é explicado por efeitos fixos
+        first_stage = ~ 0 | code_muni + date,
+        # segundo estágio: ε^_it = β_0 + β_1 priv_it  + u_it 
+        # usar esses resíduos aqui, garante que vamos mexer com a variação que já foi ajustada
+        second_stage = ~ trat,
+        # agrupa os erros padrão por UF para lidar com a correlação dentro dos grupos
+        cluster_var = "abbrev_state",
+        verbose = FALSE)
+
+did2s_gas_r_sem <- 
+  did2s::did2s(data = combustivel_cidade %>% filter(produto == "gasolina", 
+                                                    !(cidade %in% cidades_acelen$cidade)),
+        yname = "preco",
+        treatment = "trat",
+        first_stage = ~ 0 | code_muni + date,
+        second_stage = ~ trat, # CHECAR!
+        cluster_var = "abbrev_state",
+        verbose = FALSE)
+
+# com ppi
+## trat
+did2s_diesel_r_com <- 
+  did2s::did2s(data = combustivel_cidade %>% filter(produto == "diesel_s10",
+                                                    !(cidade %in% cidades_acelen$cidade)),
+        yname = "preco",
+        treatment = "trat",
+        first_stage = ~ preco_ppi | code_muni + date,
+        second_stage = ~ trat, # CHECAR!
+        cluster_var = "abbrev_state",
+        verbose = FALSE)
+
+did2s_gas_r_com <- 
+  did2s::did2s(data = combustivel_cidade %>% filter(produto == "gasolina", 
+                                                    !(cidade %in% cidades_acelen$cidade)),
+        yname = "preco",
+        treatment = "trat",
+        first_stage = ~ preco_ppi | code_muni + date,
+        second_stage = ~ trat, # CHECAR!
+        cluster_var = "abbrev_state",
+        verbose = FALSE)
+
+```
+
+```{r}
+# acelen
+# sem ppi
+## trat
+did2s_diesel_a_sem <- 
+  did2s::did2s(data = combustivel_cidade %>% filter(produto == "diesel_s10", cidade != "Manaus"),
+        yname = "preco",
+        treatment = "trat",
+        # primeiro estágio: (preco_it) = α_i + λ_t +ε_it + γ preco_brent_it
+        # retira a média de cada cidade em cada período de tempo, i.e, centraliza e foca no resíduo
+        # ajuda a isolar o que não é explicado por efeitos fixos
+        first_stage = ~ 0 | code_muni + date,
+        # segundo estágio: ε^_it = β_0 + β_1 priv_it  + u_it 
+        # usar esses resíduos aqui, garante que vamos mexer com a variação que já foi ajustada
+        second_stage = ~ trat,
+        # agrupa os erros padrão por UF para lidar com a correlação dentro dos grupos
+        cluster_var = "abbrev_state",
+        verbose = FALSE)
+
+did2s_gas_a_sem <- 
+  did2s::did2s(data = combustivel_cidade %>% filter(produto == "gasolina", cidade != "Manaus"),
+        yname = "preco",
+        treatment = "trat",
+        first_stage = ~ 0 | code_muni + date,
+        second_stage = ~ trat, # CHECAR!
+        cluster_var = "abbrev_state",
+        verbose = FALSE)
+
+# com ppi
+## trat
+did2s_diesel_a_com <- 
+  did2s::did2s(data = combustivel_cidade %>% filter(produto == "diesel_s10", cidade != "Manaus"),
+        yname = "preco",
+        treatment = "trat",
+        first_stage = ~ preco_ppi | code_muni + date,
+        second_stage = ~ trat, # CHECAR!
+        cluster_var = "abbrev_state",
+        verbose = FALSE)
+
+did2s_gas_a_com <- 
+  did2s::did2s(data = combustivel_cidade %>% filter(produto == "gasolina", cidade != "Manaus"),
+        yname = "preco",
+        treatment = "trat",
+        first_stage = ~ preco_ppi | code_muni + date,
+        second_stage = ~ trat, # CHECAR!
+        cluster_var = "abbrev_state",
+        verbose = FALSE)
+```
+
+##### 2.2.1 - a) Tabelas 
+
+Diesel 
+
+```{r}
+setwd("S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens")
+options(modelsummary_factory_html = 'huxtable',
+        modelsummary_factory_default = 'huxtable')
+
+# Efeitos fixos
+rows <- tribble(~'Tratamento', ~'(1)', ~'(2)', ~'(3)', ~'(4)',
+                'PPI', 'Yes', 'No', 'Yes', 'No',
+                'FE: Município', 'Yes', 'Yes', 'Yes', 'Yes',
+                'FE: Data', 'Yes', 'Yes', 'Yes', 'Yes')
+attr(rows, 'position') <- c(3:5)
+
+diesel_output <- modelsummary::modelsummary(list('(1)' = mqo_diesel_r_com, '(2)' = mqo_diesel_r_sem,
+                                              '(3)' = did2s_diesel_r_com, '(4)' = did2s_diesel_r_sem), 
+                           title = "Efeito REAM: Diesel S10",
+                           gof_omit = "IC|Std.Errors|F|Log.Lik.", 
+                           coef_omit = c(1,3:82), coef_rename = c("trat" = "Tratamento"),
+                           stars = T,add_rows = rows)
+
+bottom_border(diesel_output)[6, ] <- 1
+diesel_output <- to_html(diesel_output)
+
+writeLines(diesel_output, "diesel_ream_estatico.html")
+
+diesel_output <- modelsummary::modelsummary(list('(1)' = mqo_diesel_a_com, '(2)' = mqo_diesel_a_sem,
+                                              '(3)' = did2s_diesel_a_com, '(4)' = did2s_diesel_a_sem), 
+                           title = "Efeito ACELEN: Diesel S10",
+                           gof_omit = "IC|Std.Errors|F|Log.Lik.", 
+                           coef_omit = c(1,3:93), coef_rename = c("trat" = "Tratamento"),
+                           stars = T,add_rows = rows)
+
+bottom_border(diesel_output)[6, ] <- 1
+diesel_output <- to_html(diesel_output)
+
+writeLines(diesel_output, "diesel_acelen_estatico.html")
+```
+
+Gasolina 
+
+```{r}
+setwd("S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens")
+options(modelsummary_factory_html = 'huxtable',
+        modelsummary_factory_default = 'huxtable')
+
+
+gas_output <- modelsummary::modelsummary(list('(1)' = mqo_gas_r_com, '(2)' = mqo_gas_r_sem,
+                                              '(3)' = did2s_gas_r_com, '(4)' = did2s_gas_r_sem), 
+                           title = "Efeito REAM: Gasolina A",
+                           gof_omit = "IC|Std.Errors|F|Log.Lik.", 
+                           coef_omit = c(1,3:82), coef_rename = c("trat" = "Tratamento"),
+                           stars = T,add_rows = rows)
+
+bottom_border(gas_output)[6, ] <- 1
+gas_output <- to_html(gas_output)
+
+writeLines(gas_output, "gasolina_ream_estatico.html")
+
+gas_output <- modelsummary::modelsummary(list('(1)' = mqo_gas_a_com, '(2)' = mqo_gas_a_sem,
+                                              '(3)' = did2s_gas_a_com, '(4)' = did2s_gas_a_sem), 
+                           title = "Efeito ACELEN: Gasolina A",
+                           gof_omit = "IC|Std.Errors|F|Log.Lik.", 
+                           coef_omit = c(1,3:95), coef_rename = c("trat" = "Tratamento"),
+                           stars = T,add_rows = rows)
+
+bottom_border(gas_output)[6, ] <- 1
+gas_output <- to_html(gas_output)
+
+writeLines(gas_output, "gasolina_acelen_estatico.html")
+```
+
+#### 2.2.2 Dinâmico (Estudo de Evento)
+
+```{r}
+# Etapas:
+# Mantém a primeira  e adapta a segunda da seguinte forma: 
+# 2'.  regredindo contra cada  período 
+#   
+#             Y_{gpit} − \hat{λ}g − \hat{γ}_p ~ D_{−Rgp}, ... , D_{0gt}, ... , D_{Pgp}
+#
+# Vale destacar que {D_{−Rgp}, ... , D_{0gt}} indica pré-tratamento, ao passo que D_{1gp}, ... , D_{Pgt} indica pós
+# 
+# did2s::did2s(data = combustivel_petrobras %>% filter(produto == "gasolina"),
+#         yname = "preco",
+#         treatment = "priv",
+#         first_stage =  ~ 0 | code_muni + date,
+#         second_stage = ~ i(tempo_priv, ref = c(-1, -Inf)), # CHECAR!
+#         cluster_var = "abbrev_state",
+#         verbose = FALSE) %>% 
+#   fixest::iplot(xlim = c(-26,28))
+# 
+# did2s::did2s(data = combustivel_petrobras %>% filter(produto == "gasolina",
+#                                                      cidade != "Barcarena"),
+#         yname = "preco",
+#         treatment = "priv",
+#         first_stage = ~ preco_ppi | code_muni + date,
+#         second_stage = ~ i(tempo_priv, ref = c(-1, -Inf)), # CHECAR!
+#         cluster_var = "abbrev_state",
+#         verbose = FALSE) %>% 
+#   fixest::iplot(xlim = c(-26,28),
+#                 main = "Efeito da privatização: sobrepreço",
+#                 sub = "Estudo de Evento: DiD em dois estágios",
+#                 xlab = "Tempo do Tratamento")
+```
+
+```{r}
+# did2s::did2s(data = combustivel_todas %>% filter(produto == "diesel_s10"),
+#         yname = "preco",
+#         treatment = "priv",
+#         first_stage =  ~ 0 | code_muni + date,
+#         second_stage = ~ i(tempo_priv, ref = c(-1, -Inf)), # CHECAR!
+#         cluster_var = "abbrev_state",
+#         verbose = FALSE) %>% 
+#   fixest::iplot(xlim = c(-27,28))
+# 
+# 
+# did2s::did2s(data = combustivel_todas %>% filter(produto == "diesel_s10",
+#                                                 cidade != "Barcarena"),
+#         yname = "preco",
+#         treatment = "priv",
+#         first_stage = ~ preco_ppi | code_muni + date,
+#         second_stage = ~ i(tempo_priv, ref = c(-1, -Inf)), # CHECAR!
+#         cluster_var = "abbrev_state",
+#         verbose = FALSE) %>% 
+#   fixest::iplot(xlim = c(-27,28))
+```
+
+```{r}
+# diesel
+## acelen
+did2s_diesel_a <- did2s::did2s(data = combustivel_cidade %>% filter(produto == "diesel_s10",
+                                                                        cidade != "Manaus"),
+        yname = "preco",
+        treatment = "trat",
+        first_stage = ~ preco_ppi | code_muni + date,
+        second_stage = ~ i(tempo_priv, ref = c(-1, -Inf)),
+        cluster_var = "abbrev_state",
+        verbose = FALSE)
+
+# ream
+did2s_diesel_r <- did2s::did2s(data = combustivel_cidade %>% 
+                                 filter(produto == "diesel_s10",
+                                        !(cidade %in% cidades_acelen$cidade)),
+        yname = "preco",
+        treatment = "trat",
+        first_stage = ~ preco_ppi | code_muni + date,
+        second_stage = ~ i(tempo_priv, ref = c(-1, -Inf)),
+        cluster_var = "abbrev_state",
+        verbose = FALSE)
+
+# gasolina
+## acelen
+did2s_gas_a <- did2s::did2s(data = combustivel_cidade %>% filter(produto == "gasolina",
+                                                                        cidade != "Manaus"),
+        yname = "preco",
+        treatment = "trat",
+        first_stage = ~ preco_ppi | code_muni + date,
+        second_stage = ~ i(tempo_priv, ref = c(-1, -Inf)),
+        cluster_var = "abbrev_state",
+        verbose = FALSE)
+
+# ream
+did2s_gas_r <- did2s::did2s(data = combustivel_cidade %>% 
+                                 filter(produto == "gasolina",
+                                        !(cidade %in% cidades_acelen$cidade)),
+        yname = "preco",
+        treatment = "trat",
+        first_stage = ~ preco_ppi | code_muni + date,
+        second_stage = ~ i(tempo_priv, ref = c(-1, -Inf)),
+        cluster_var = "abbrev_state",
+        verbose = FALSE)
+```
+
+##### 2.2.2 - a) Gráficos
+
+Diesel
+
+```{r}
+# ACELEN
+confint(did2s_diesel_a, level = 0.95) %>% # intervalo de confiança
+  rownames_to_column("tempo_priv") %>% 
+  right_join(
+    
+    did2s_diesel_a$coeftable %>% as.data.frame() %>% # estimativas
+      rownames_to_column("tempo_priv"),
+    
+    by = join_by(tempo_priv)
+  ) %>%
+  mutate(tempo_priv = sub(".*tempo_priv::", "",tempo_priv) %>% as.numeric(),
+         ref = "ACELEN") %>% 
+  select(tempo_priv, ref, Estimate, everything()) %>% 
+  # combinanado os resultados da refinarias
+  rbind(
+# REAM
+  confint(did2s_diesel_r, level = 0.95) %>% 
+  rownames_to_column("tempo_priv") %>% 
+  right_join(
+    
+    did2s_diesel_r$coeftable %>% as.data.frame() %>% 
+      rownames_to_column("tempo_priv"),
+    
+    by = join_by(tempo_priv)
+  ) %>%
+  mutate(tempo_priv = sub(".*tempo_priv::", "",tempo_priv) %>% as.numeric(),
+         ref = "REAM") %>% 
+  select(tempo_priv, ref, Estimate, everything())
+  ) %>%
+  rename("Coeficientes" = Estimate,
+         "Tempo do tratamento" = tempo_priv) %>% 
+# Plotando resultados
+  filter(`Tempo do tratamento` > -25) %>% 
+  ggplot(aes(x = `Tempo do tratamento`, y = Coeficientes,
+             group = ref, colour = ref, 
+             ymin = `2.5 %`, ymax = `97.5 %`))+
+  geom_line()+
+  geom_pointrange()+
+  ggtitle(label = "Estudo de evento: Diesel S10")+
+  labs(color = "Refinaria")+
+  theme_bw()+
+  theme(
+    plot.title = element_text(size = 18),
+    plot.subtitle = element_text(size = 14)
+  )
+ggsave(filename = "did2s_ref_diesel.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens")
+```
+
+Gasolina 
+
+```{r}
+# ACELEN
+confint(did2s_gas_a, level = 0.95) %>% # intervalo de confiança
+  rownames_to_column("tempo_priv") %>% 
+  right_join(
+    
+    did2s_gas_a$coeftable %>% as.data.frame() %>% # estimativas
+      rownames_to_column("tempo_priv"),
+    
+    by = join_by(tempo_priv)
+  ) %>%
+  mutate(tempo_priv = sub(".*tempo_priv::", "",tempo_priv) %>% as.numeric(),
+         ref = "ACELEN") %>% 
+  select(tempo_priv, ref, Estimate, everything()) %>% 
+  # combinanado os resultados da refinarias
+  rbind(
+# REAM
+  confint(did2s_gas_r, level = 0.95) %>% 
+  rownames_to_column("tempo_priv") %>% 
+  right_join(
+    
+    did2s_gas_r$coeftable %>% as.data.frame() %>% 
+      rownames_to_column("tempo_priv"),
+    
+    by = join_by(tempo_priv)
+  ) %>%
+  mutate(tempo_priv = sub(".*tempo_priv::", "",tempo_priv) %>% as.numeric(),
+         ref = "REAM") %>% 
+  select(tempo_priv, ref, Estimate, everything())
+  ) %>%
+  rename("Coeficientes" = Estimate,
+         "Tempo do tratamento" = tempo_priv) %>% 
+# Plotando resultados
+  filter(`Tempo do tratamento` > -25) %>% 
+  ggplot(aes(x = `Tempo do tratamento`, y = Coeficientes,
+             group = ref, colour = ref, 
+             ymin = `2.5 %`, ymax = `97.5 %`))+
+  geom_line()+
+  geom_pointrange()+
+  ggtitle(label = "Estudo de evento: Gasolina A")+
+  labs(color = "Refinaria")+
+  theme_bw()+
+  theme(
+    plot.title = element_text(size = 18),
+    plot.subtitle = element_text(size = 14)
+  )
+ggsave(filename = "did2s_ref_gas.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens")
+```
+
+## 2.3 ETWFE
+
+Aqui, é o mesmo que o impacto de uma desintegração vertcial em em preços
+uma adaptação do trazido em Vertical Intergation between hospitals and insurers na seção 3.3.3 (pp 22)
+https://epge.fgv.br/files/default/vertical-integration-between-hospitals-and-insurers.pdf
+
+corrigindo o estudo de evento!
+EXTENDED Two-Way Fixed Effects
+retorna o mesmo resultado que um Two-Way Mundlak Regression, pooled OLS, did do Sant'anna
+  https://economics.princeton.edu/wp-content/uploads/2021/08/two_way_mundlak-Wooldridge.pdf (2021)
+  https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4183726 (2022, pp 22-41)
+
+aplicação:  https://arelbundock.com/posts/extendedtwfe/ (2021)
+            https://cran.r-project.org/web/packages/etwfe/etwfe.pdf (2024)
+
+"Instead of only including a single treatment × time interaction, Wooldridge recommends that
+we saturate our model with all possible interactions between treatment and time variables,
+including treatment cohorts, as well as other covariates." (Grant McDermott, 2024)
+
+Cenário considerado: combustivel_cidade
+
+```{r}
+gas <- combustivel_cidade %>%                                
+  filter(!is.na(preco_ppi),
+         produto == "gasolina") %>% 
+  group_by(coorte, date) %>% 
+  mutate(
+    ppi_dm = preco_ppi - mean(preco_ppi, na.rm = TRUE),
+    trat= as.logical(trat)
+    # coorte = as.numeric(coorte), data = as.numeric(data),
+  ) %>% ungroup() %>% arrange(date, code_muni) 
+```
+
+```{r}
+diesel <- combustivel_cidade %>% 
+  filter(!is.na(preco_ppi),
+         produto == "diesel_s10") %>% 
+  group_by(coorte, date) %>% 
+  mutate(
+    ppi_dm = preco_ppi - mean(preco_ppi, na.rm = TRUE),
+    trat = as.logical(trat)
+    # coorte = as.numeric(coorte), data = as.numeric(data),
+  ) %>% ungroup() %>% arrange(date, code_muni) 
+```
+
+```{r}
+modg_ppi = fixest::feols(
+  preco ~ trat:i(coorte, i.date, ref = as.Date("1970-01-01"), ref2 = as.Date("2019-09-01")) / ppi_dm|
+    coorte[preco_ppi] + date[preco_ppi] + modalidade[preco_ppi],
+  data = gas, 
+  vcov = ~ abbrev_state
+)
+
+modd_ppi = fixest::feols(
+  preco ~ trat:i(coorte, i.date, ref = as.Date("1970-01-01"), ref2 = as.Date("2019-09-01")) / ppi_dm|
+    coorte[preco_ppi] + date[preco_ppi],
+  data = diesel, 
+  vcov = ~ abbrev_state
+)
+
+modg = fixest::feols(
+  preco ~ trat:i(coorte, i.date, ref = as.Date("1970-01-01"), ref2 = as.Date("2019-09-01"))|
+    coorte + date + modalidade,
+  data = gas, 
+  vcov = ~ abbrev_state
+)
+
+modd = fixest::feols(
+  preco ~ trat:i(coorte, i.date, ref = as.Date("1970-01-01"), ref2 = as.Date("2019-09-01"))|
+    coorte + date,
+  data = diesel, 
+  vcov = ~ abbrev_state
+)
+
+# Comparando o modelo com ppi e sem
+# coef_etwfe <- 
+#   modg[["coeftable"]] %>% as.data.frame() %>% rownames_to_column("term") %>% 
+#   mutate(a = str_extract(term, "ppi_dm")) %>% 
+#   filter(is.na(a)) %>% select(-a) %>% 
+#   mutate(coorte = str_extract(term, "(?<=coorte::)\\d{4}-\\d{2}-\\d{2}"),
+#       date = str_extract(term, "(?<=date::)\\d{4}-\\d{2}-\\d{2}"),,
+#     date = str_extract(term, "(?<=date::)\\d{4}-\\d{2}-\\d{2}"),
+#     produto = "gasolina"
+#     ) %>% 
+#   select(coorte, date, everything(),-term) %>% 
+#   
+#   rbind(
+#     
+#     modd[["coeftable"]] %>% as.data.frame() %>% rownames_to_column("term") %>% 
+#   mutate(a = str_extract(term, "ppi_dm")) %>% 
+#   filter(is.na(a)) %>% select(-a) %>% 
+#   mutate(coorte = str_extract(term, "(?<=coorte::)\\d{4}-\\d{2}-\\d{2}"),
+#       date = str_extract(term, "(?<=date::)\\d{4}-\\d{2}-\\d{2}"),
+#       produto = "diesel"
+#       ) %>% 
+#     select(coorte, date, everything(),-term)
+#   ) %>%
+# 
+#   rbind(
+# 
+#     modg_ppi[["coeftable"]] %>% as.data.frame() %>% rownames_to_column("term") %>% 
+#   mutate(a = str_extract(term, "ppi_dm")) %>% 
+#   filter(is.na(a)) %>% select(-a) %>% 
+#   mutate(coorte = str_extract(term, "(?<=coorte::)\\d{4}-\\d{2}-\\d{2}"),
+#       date = str_extract(term, "(?<=date::)\\d{4}-\\d{2}-\\d{2}"),
+#       produto = "gasolina_ppi"
+#       ) %>%
+#     select(coorte, date, everything(),-term)
+#   ) %>%
+# 
+#   rbind(
+# 
+#     modd_ppi[["coeftable"]] %>% as.data.frame() %>% rownames_to_column("term") %>% 
+#   mutate(a = str_extract(term, "ppi_dm")) %>% 
+#   filter(is.na(a)) %>% select(-a) %>% 
+#   mutate(coorte = str_extract(term, "(?<=coorte::)\\d{4}-\\d{2}-\\d{2}"),
+#       date = str_extract(term, "(?<=date::)\\d{4}-\\d{2}-\\d{2}"),
+#       produto = "diesel_ppi"
+#       ) %>%
+#     select(coorte, date, everything(),-term)) %>%
+#   ungroup()
+# 
+# coef_etwfe %>% 
+#   ggplot(aes(as.Date(date), Estimate, group = coorte, colour = coorte,
+#              # ymin = ci_low, ymax = ci_high
+#              ))+
+#   geom_hline(yintercept = 0, linetype = "dashed", color = "darkgrey", linewidth = 1.3) +
+#   geom_line(linewidth = 1)+
+#   facet_wrap(~produto)
+```
+
+```{r}
+# diesel
+modg_ppi[["coeftable"]] %>% as.data.frame() %>% rownames_to_column("term") %>% 
+  mutate(a = str_extract(term, "ppi_dm")) %>% 
+  filter(is.na(a)) %>% select(-a) %>% 
+  mutate(coorte = str_extract(term, "(?<=coorte::)\\d{4}-\\d{2}-\\d{2}"),
+      date = str_extract(term, "(?<=date::)\\d{4}-\\d{2}-\\d{2}"),
+      produto = "gasolina_ppi") %>%
+    select(coorte, date, everything(),-term) %>%
+  ungroup() %>% 
+  ggplot(aes(as.Date(date), Estimate, group = coorte, colour = coorte,
+             #ymin = ci_low, ymax = ci_high
+             ))+
+  geom_hline(yintercept = 0, linetype = "dashed", color = "darkgrey", linewidth = 1.3) +
+  geom_line(linewidth = 1)+theme_bw()+
+  labs(title = "Efeito da privatização: Diesel S10",
+       subtitle = "Sobrepreço por coorte em tempo de calendário")+
+  xlab("")
+
+# gasolina
+modd_ppi[["coeftable"]] %>% as.data.frame() %>% rownames_to_column("term") %>% 
+  mutate(a = str_extract(term, "ppi_dm")) %>% 
+  filter(is.na(a)) %>% select(-a) %>% 
+  mutate(coorte = str_extract(term, "(?<=coorte::)\\d{4}-\\d{2}-\\d{2}"),
+      date = str_extract(term, "(?<=date::)\\d{4}-\\d{2}-\\d{2}"),
+      produto = "gasolina_ppi") %>%
+    select(coorte, date, everything(),-term) %>%
+  ungroup() %>% 
+  ggplot(aes(as.Date(date), Estimate, group = coorte, colour = coorte,
+             # ymin = ci_low, ymax = ci_high
+             ))+
+  geom_hline(yintercept = 0, linetype = "dashed", color = "darkgrey", linewidth = 1.3) +
+  geom_line(linewidth = 1)+
+  theme_bw()+
+  labs(title = "Efeito da privatização (Etwfe): Diesel S10",
+       subtitle = "Sobrepreço por coorte em tempo de calendário")+
+  xlab("")
+```
+
+#### 2.3.1 Agregando
+
+```{r}
+# agregando estimações estimativas de grupo no tempo
+# Partial derivative of the regression equation with respect to a regressor of interest.
+# etwfe_avg_gas <- marginaleffects::slopes(
+#   modg_ppi,
+#   newdata = subset(gas, trat),
+#   variables = "trat",
+#   by = "trat"
+# )
+# 
+# ## por coorte
+# etwfe_avg_coorte_gas <- marginaleffects::slopes(
+#   modg_ppi,
+#   newdata = subset(gas, trat),
+#   variables = "trat",
+#   by = "coorte"
+# )
+# 
+# ## por tempo de privatização
+# etwfe_avg_tpriv_gas <- marginaleffects::slopes(
+#   modg_ppi,
+#   newdata = subset(gas, trat),
+#   variables = "trat",
+#  by = c("tempo_priv")
+# ) 
+# 
+# etwfe_avg_tpriv_gas %>% 
+#   ggplot(aes(x = tempo_priv, y = estimate, 
+#              ymin = conf.low, ymax = conf.high))+
+#   geom_line()+
+#   geom_pointrange(colour = "indianred")+
+#   labs(title = "Efeito da privatização: Gasolina A",
+#        subtile = "Sobrepreço por tempo de tratamento")+
+#   xlab("Tempo de tratamento")+
+#   theme_bw()
+# 
+# ## por tempo de calendário
+# etwfe_avg_date_gas <- marginaleffects::slopes(
+#   modg_ppi,
+#   newdata = subset(gas, trat),
+#   variables = "trat",
+#   by = "date"
+# ) 
+# 
+# etwfe_avg_date_gas %>% 
+#   ggplot(aes(x = date, y = estimate,
+#              ymin = conf.low, ymax = conf.high))+
+#   geom_line()+
+#   geom_pointrange(colour = "indianred")+
+#   labs(title = "Efeito da privatização: Gasolina A",
+#        subtile = "Sobrepreço por tempo de calendário")+
+#   xlab("")+
+#   theme_bw()
+```
+
+```{r}
+## por refinaria
+etwfe_avg_ref_gas <- marginaleffects::slopes(
+  modg_ppi,
+  newdata = subset(gas, trat),
+  variables = "trat",
+  by = "refinaria"
+)
+
+## por tempo de privatização E refinaria
+etwfe_avg_ref_tpriv_gas <- marginaleffects::slopes(
+  modg_ppi,
+  newdata = subset(gas, trat),
+  variables = "trat",
+ by = c("refinaria","tempo_priv")
+)
+```
+
+
+```{r}
+setwd("S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens")
+library(huxtable)
+options(modelsummary_factory_html = 'huxtable',
+        modelsummary_factory_default = 'huxtable')
+
+etwfe_avg_ref_gas <- modelsummary::modelsummary(
+  models = list('Tratamento' = etwfe_avg_ref_gas %>%
+                  mutate(term = refinaria, term = str_to_upper(term)) %>% 
+                  filter(refinaria != "petrobras")), 
+  shape =  model + statistic ~ term , stars = T, title = "Efeito médio: Gasolina A") %>% to_html()
+
+writeLines(etwfe_avg_ref_gas, "etwfe_avg_gas.html")
+
+# Resultado do agregado por refinaria E tempo SEM petrobras
+etwfe_avg_ref_tpriv_gas %>%
+  filter(refinaria != "petrobras") %>% 
+  mutate(refinaria = case_when(refinaria == "acelen" ~ "ACELEN",
+                               refinaria == "ream" ~ "REAM")) %>% 
+  rename("Coeficientes" = estimate,
+         "Tempo do tratamento" = tempo_priv) %>% 
+  ggplot(aes(x = `Tempo do tratamento`, y = `Coeficientes`,
+             group = refinaria, colour = refinaria,
+             ymin = conf.low, ymax = conf.high))+
+  geom_line()+
+  geom_pointrange()+
+  ggtitle(label = "Estudo de evento: Gasolina A",
+          subtitle = "Agregação das estimativas por refinaria")+
+  labs(color = "Refinaria")+
+  theme_bw()+
+  theme(
+    plot.title = element_text(size = 18),
+    plot.subtitle = element_text(size = 14)
+  )
+ggsave(filename = "etwfe_avg_tempo_gas.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens")
+```
+
+
+```{r}
+# agregando estimações estimativas de grupo no tempo: DIESEL
+# Partial derivative of the regression equation with respect to a regressor of interest.
+# etwfe_avg_diesel <- marginaleffects::slopes(
+#   modd_ppi,
+#   newdata = subset(diesel, trat),
+#   variables = "trat",
+#   by = "trat"
+# )
+# 
+# ## por coorte
+# etwfe_avg_coorte_diesel <- marginaleffects::slopes(
+#   modd_ppi,
+#   newdata = subset(diesel, trat),
+#   variables = "trat",
+#   by = "coorte"
+# )
+# 
+# ## por tempo de privatização
+# etwfe_avg_tpriv_diesel <- marginaleffects::slopes(
+#   modd_ppi,
+#   newdata = subset(diesel, trat),
+#   variables = "trat",
+#  by = c("tempo_priv")
+# ) 
+# 
+# etwfe_avg_tpriv_diesel %>% 
+#   ggplot(aes(x = tempo_priv, y = estimate, 
+#              ymin = conf.low, ymax = conf.high))+
+#   geom_line()+
+#   geom_pointrange(colour = "indianred")+
+#   labs(title = "Efeito da privatização: dieselolina A",
+#        subtile = "Sobrepreço por tempo de tratamento")+
+#   xlab("Tempo de tratamento")+
+#   theme_bw()
+# 
+# ## por tempo de calendário
+# etwfe_avg_date_diesel <- marginaleffects::slopes(
+#   modg_ppi,
+#   newdata = subset(diesel, trat),
+#   variables = "trat",
+#   by = "date"
+# ) 
+# 
+# etwfe_avg_date_diesel %>% 
+#   ggplot(aes(x = date, y = estimate,
+#              ymin = conf.low, ymax = conf.high))+
+#   geom_line()+
+#   geom_pointrange(colour = "indianred")+
+#   labs(title = "Efeito da privatização: dieselolina A",
+#        subtile = "Sobrepreço por tempo de calendário")+
+#   xlab("")+
+#   theme_bw()
+```
+
+```{r}
+## por refinaria
+etwfe_avg_ref_diesel <- marginaleffects::slopes(
+  modd_ppi,
+  newdata = subset(diesel, trat),
+  variables = "trat",
+  by = "refinaria"
+)
+
+## por tempo de privatização E refinaria
+etwfe_avg_ref_tpriv_diesel <- marginaleffects::slopes(
+  modd_ppi,
+  newdata = subset(diesel, trat),
+  variables = "trat",
+ by = c("refinaria","tempo_priv")
+)
+```
+
+##### 2.3.1 - a) Gráficos
+
+```{r}
+setwd("S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens")
+library(huxtable)
+options(modelsummary_factory_html = 'huxtable',
+        modelsummary_factory_default = 'huxtable')
+
+etwfe_avg_ref_diesel <- modelsummary::modelsummary(
+  models = list('Tratamento' = etwfe_avg_ref_diesel %>%
+                  mutate(term = refinaria, term = str_to_upper(term)) %>% 
+                  filter(refinaria != "petrobras")), 
+  shape =  model + statistic ~ term , stars = T, title = "Efeito médio: Diesel S10") %>% to_html()
+
+writeLines(etwfe_avg_ref_diesel, "etwfe_avg_diesel.html")
+
+# Resultado do agregado por refinaria E tempo SEM petrobras
+etwfe_avg_ref_tpriv_diesel %>%
+  filter(refinaria != "petrobras") %>% 
+  mutate(refinaria = case_when(refinaria == "acelen" ~ "ACELEN",
+                               refinaria == "ream" ~ "REAM")) %>% 
+  rename("Coeficientes" = estimate,
+         "Tempo do tratamento" = tempo_priv) %>% 
+  ggplot(aes(x = `Tempo do tratamento`, y = `Coeficientes`,
+             group = refinaria, colour = refinaria,
+             ymin = conf.low, ymax = conf.high))+
+  geom_line()+
+  geom_pointrange()+
+  ggtitle(label = "Estudo de evento: Diesel S10",
+          subtitle = "Agregação das estimativas por refinaria")+
+  labs(color = "Refinaria")+
+  theme_bw()+
+  theme(
+    plot.title = element_text(size = 18),
+    plot.subtitle = element_text(size = 14)
+  )
+ggsave(filename = "etwfe_avg_tempo_diesel.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens")
+```
+
+## 2.4 Acelen contra ela mesma
+
+Aqui é um prelúdio só do João brilhando em comparação!
+
+```{r}
+# ANOVA sugere que há diferenças entre grupos
+# Teste de Tukey vê diferenças significativas entre pares de médias
+teste_tukey <- aov(preco ~ cidade * date * modalidade, data = gas %>% filter(refinaria == "acelen")) %>% TukeyHSD("cidade")
+
+teste_tukey[["cidade"]] %>% as.data.frame() %>% rownames_to_column("cidade") %>%
+  filter(`p adj` <= 0.05)
+```
+
+```{r}
+rm(list = ls()[!ls() %in% c("brasil","gas", "diesel", "df_combustivel")])
+```
+
+# 3 Análise Exploratória
+
+Só preço
+```{r}
+# for (prod in c("gasolina","diesel_s10")) {
+#   
+#   cidades <- df_combustivel %>% filter(produto == prod) %>% 
+#     group_by(cidade, code_muni) %>% summarise(.groups = "drop")
+#   
+#   for (cid in cidades$cidade) {
+#     
+#     teste <- df_combustivel %>% 
+#       filter(produto == prod,
+#              cidade == cid,
+#              !(is.na(preco)))
+#              
+#     p <- teste %>% 
+#       ggplot(aes(x = date, y = preco,  
+#                  group = interaction(modalidade, refinaria), colour = interaction(modalidade, refinaria)))+
+#       geom_line()+
+#       geom_point(aes(shape = as.factor(priv)))+
+#       geom_vline(data = teste %>% 
+#                   group_by(cidade, coorte) %>% 
+#                   summarise(.groups = "drop") %>% 
+#                   mutate(coorte = as.Date(coorte)),
+#                 aes(xintercept = coorte), 
+#                 colour = "grey22", linetype = "twodash", size = 0.65)+
+#       labs(title = paste("Evolução do preço de", prod, "em", cid, "- PPI X doméstico", sep = " "),
+#            subtitle = "Em cinza, preços de paridade de importação (PPI)")+
+#       theme_bw()+
+#       scale_colour_viridis_d()
+#     
+#     print(p)
+#   }
+# }
+# 
+# rm(p)
+```
+
+```{r}
+# Tudo junto
+
+# diesel
+teste <- df_combustivel %>%
+    filter(cidade %in% c("Candeias","Manaus","Santos","Paulínia"),
+           produto == "diesel_s10")
+teste %>% 
+    ggplot()+
+    facet_wrap( ~ cidade, scale = "free")+
+    geom_area(aes(x = date, y = preco_ppi), fill = "lightgrey")+
+    geom_line(aes(x = date, y = preco, group = modalidade, colour = modalidade))+
+    geom_point(aes(x = date, y = preco, group = modalidade, 
+                   colour = modalidade,shape = as.factor(priv)), size = 0.75)+
+    geom_vline(data = teste %>% 
+                 group_by(cidade, coorte) %>% 
+                 summarise(.groups = "drop") %>% 
+                 mutate(coorte = as.Date(coorte)),
+               aes(xintercept = coorte), 
+               colour = "grey22", linetype = "twodash", size = 0.65)+
+    labs(title = "Evolução do preço do Diesel S10 - PPI X doméstico",
+         subtitle = "Em cinza, preços de paridade de importação (PPI)",
+         color = "Modalidade",
+         shape = "Refinaria é privada?")+
+    theme_bw()+
+    scale_colour_brewer(palette = "Set1")
+
+ggsave("preços_ppi_cidades_die.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens")
+
+# gasolina
+teste <- df_combustivel %>%
+    filter(cidade %in% c("Candeias","Manaus","Santos","Paulínia"),
+           produto == "gasolina")
+teste %>% 
+    ggplot()+
+    facet_wrap( ~ cidade, scale = "free")+
+    geom_area(aes(x = date, y = preco_ppi), fill = "lightgrey")+
+    geom_line(aes(x = date, y = preco, group = modalidade, colour = modalidade))+
+    geom_point(aes(x = date, y = preco, group = modalidade, 
+                   colour = modalidade,shape = as.factor(priv)), size = 1.25)+
+    geom_vline(data = teste %>% 
+                 group_by(cidade, coorte) %>% 
+                 summarise(.groups = "drop") %>% 
+                 mutate(coorte = as.Date(coorte)),
+               aes(xintercept = coorte), 
+               colour = "grey22", linetype = "twodash", size = 0.65)+
+    labs(title = "Evolução do preço do Gasolina A - PPI X doméstico",
+         subtitle = "Em cinza, preços de paridade de importação (PPI)",
+         color = "Modalidade",
+         shape = "Refinaria é privada?")+
+    theme_bw()+
+    scale_colour_brewer(palette = "Set1")
+
+ggsave("preços_ppi_cidades_gas.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens")
+
+```
+
+```{r}
+# Individual
+for (prod in c("diesel_s10","gasolina")) {
+
+  for (cid in c("Candeias","Manaus","Santos","Paulínia")) {
+
+    teste <- df_combustivel %>%
+      filter(produto == prod,
+             cidade == cid,
+             !(is.na(preco)))
+
+    p <- teste %>%
+      ggplot(aes(x = date, y = preco,
+                 group = interaction(modalidade, refinaria), colour = interaction(modalidade, refinaria)))+
+      geom_line()+
+      geom_point(aes(shape = as.factor(priv)))+
+      geom_vline(data = teste %>%
+                  group_by(cidade, coorte) %>%
+                  summarise(.groups = "drop") %>%
+                  mutate(coorte = as.Date(coorte)),
+                aes(xintercept = coorte),
+                colour = "grey22", linetype = "twodash", size = 0.65)+
+      labs(title = paste("Evolução do preço de", prod, "em", cid, sep = " "),
+           color = "Modalidade",
+           shape = "Refinaria é privada?")+
+      theme_bw()+
+      scale_colour_brewer(palette = "Set1")
+
+    print(p)
+    
+    if (prod == "diesel_s10"){nome = paste("preços_ppi",cid,"die.png", sep = "_")}
+    else {nome = paste("preços_ppi",cid,"gas.png", sep = "_")}
+    
+    ggsave(nome,
+           path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens")
+  }
+}
+
+rm(p)
+```
+
+
+# 4 Comparação
+
+Créditos ao João Isído, o cara é bom!
+
+```{r}
+rm(list = ls())
+```
+
+Avaliar o aumento de preço por si só NÃO é o mesmo que avaliar uma conduta.
+
+Carregando os dados MENSAIS:
+```{r}
+df_combustivel <- readRDS(file = "S:/CECAN/Felipe Raposo/Refino/Bases/preco_combustiveis_mensal.rds")
+```
+
+Excluindo a intervenção em Janeiro de 2021.
+```{r}
+filtro<- df_combustivel$data == "2021-01" & df_combustivel$refinaria == "acelen"
+df_combustivel<- df_combustivel[!filtro,]
+```
+
+Uma função para calcular a diferença de meses.
+```{r}
+# turn a date into a 'monthnumber' relative to an origin
+monnb <- function(d){
+  lt <- as.POSIXlt(as.Date(d, origin="1900-01-01"))
+  lt$year*12 + lt$mon}
+
+# compute a month difference as a difference between two monnb's
+mondf <- function(d1, d2) {monnb(d2) - monnb(d1)}
+
+# Fonte: https://stackoverflow.com/questions/1995933/number-of-months-between-two-dates
+```
+
+Deflacionando
+```{r}
+df_combustivel$preco <- deflateBR::ipca(df_combustivel$preco, as.Date(df_combustivel$date), "07/2024")
+```
+
+Calculando a média móvel e o número de dias desde a intervenção.
+```{r}
+df_combustivel<-
+  df_combustivel %>%
+  ungroup() %>%
+  group_by(code_cidade, modalidade, refinaria, produto) %>% 
+  arrange(code_cidade, modalidade, refinaria, produto, ano, mes) %>%
+  mutate(p_12 = zoo::rollmean(x = preco, k = 12, fill = NA, align = "right"),
+         p_12_def = zoo::rollmean(x = preco_def, k = 12, fill = NA, align = "right")) %>% 
+  ungroup() %>% # A unidade de tratamento é o município. Os preços do do ID mudam com a nova concorrente.
+  group_by(produto, code_cidade, ano, mes) %>%
+  mutate(w = if_else(condition = sum(priv) > 0, true = 1, false = 0)) %>% 
+  ungroup() %>% #
+  group_by(code_cidade, produto) %>% 
+  arrange(code_cidade, modalidade, refinaria, produto, ano, mes) %>%
+  mutate(tempo_priv = date*w,
+         tempo_priv2 = if_else(condition = length(unique(tempo_priv)) == 1,
+                               true = 0,
+                               false = sort(unique(tempo_priv))[2]),
+         tempo_priv3 = tempo_priv2*w,
+         tempo_priv = mondf(tempo_priv3, tempo_priv),
+         rel_year = if_else(condition = tempo_priv2 > 0,
+                            true = mondf(tempo_priv2, date),
+                            false = Inf)) %>% ungroup()
+  # select(-tempo_priv2,-tempo_priv3)
+```
+
+Filtros
+```{r}
+# Filtro para exclusão de municípios para gasolina
+filtro_gas<- !df_combustivel$code_cidade %in% c("1501303", "3548500", "2929206", "2111300")
+
+# Filtrando o combustível
+df_gasolina<- df_combustivel %>% filter(produto == "gasolina", !code_cidade %in% filtro_gas)
+
+# Filtro para exclusão de municípios para diesel
+filtro_die<- !df_combustivel$code_cidade %in% c("1501303", "2704302", "5218805", "5107602", "2111300")
+
+# Filtrando o combustível
+df_diesel<- df_combustivel %>% filter(produto == "diesel_s10", !code_cidade %in% filtro_die)
+```
+
+Excluindo lixo 
+```{r}
+rm(filtro, mondf, monnb, filtro_gas, filtro_die)
+```
+
+Paleta de cores
+```{r}
+distinct_colors <- c(
+  "#E41A1C",  # Red
+  "#377EB8",  # Blue
+  "#4DAF4A",  # Green
+  "#00CCFF",  # Purple
+  "#FF7F00",  # Orange
+  "#A65628",  # Brown
+  "#FFFF33",  # Yellow
+  "#999999",  # Grey
+  "#66FF00",  # Pink
+  "#66C2A5",  # Light Green
+  "#FC8D62",  # Salmon
+  "#8DA0CB",  # Light Blue
+  "#FF00FF",  # Light Pink  "#A6D854",  # Light Lime Green
+  "#FF1493",  # Deep Pink
+  "#FFD700",  # Gold
+  "#6495ED",  # Cornflower Blue
+  "#32CD32",  # Lime Green
+  "#DC143C",  # Crimson
+  "#20B2AA",  # Light Sea Green
+  "#FFA500",  # Dark Orange
+  "#8B4513",  # Saddle Brown
+  "#DA70D6",  # Orchid
+  "#B22222",  # Firebrick
+  "#FF4500",  # Orange Red
+  "#1E90FF",  # Dodger Blue
+  "#ADFF2F",  # Green Yellow
+  "#FF69B4",  # Hot Pink
+  "#87CEEB",  # Sky Blue
+  "#BA55D3",  # Medium Orchid
+  "#FFDAB9",  # Peach Puff
+  "#7B68EE",  # Medium Slate Blue
+  "#CD5C5C",  # Indian Red
+  "#40E0D0",  # Turquoise
+  "#FF6347",  # Tomato
+  "#4682B4",  # Steel Blue
+  "#7FFF00",  # Chartreuse
+  "#6B8E23",  # Olive Drab
+  "#D2691E",  # Chocolate
+  "#008080"   # Teal
+)
+
+```
+
+## 4.1 Gasolina
+
+Dados carregados no código anterior.
+
+Eis os preços das cidades atendidas pela Acelen (os filtros de municipios foram aplicadados).
+```{r}
+df_gasolina %>% filter(refinaria == "acelen") %>% 
+  rename(Preço = preco,
+         Data = data) %>% 
+  ggplot(aes(x = Data, y = Preço, group = factor(code_cidade), color = factor(Cidade)))+
+  geom_point()+
+  geom_line()+
+  scale_color_manual(values = distinct_colors)+
+  labs(color = "Cidade",
+       title = "Série de preços: ACELEN - Gasolina A")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ggsave("preços_gas_cidades_acelen.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens")
+```
+
+Façamos também para PETROBRAS e REAM. 
+
+```{r}
+# petrobras
+df_gasolina %>% filter(refinaria == "petrobras") %>% 
+  rename(Preço = preco,
+         Data = data) %>% 
+  ggplot(aes(x = Data, y = Preço, group = factor(code_cidade), color = factor(Cidade)))+
+  geom_point()+
+  geom_line()+
+  scale_color_manual(values = distinct_colors)+
+  labs(color = "Cidade",
+       title = "Série de preços: PETROBRAS - Gasolina A")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ggsave("preços_gas_cidades_petrobras.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+       width = 10, height = 8,
+       units = "in",dpi = 320)
+# ream
+df_gasolina %>% filter(refinaria == "ream") %>% 
+  rename(Preço = preco,
+         Data = data) %>% 
+  ggplot(aes(x = Data, y = Preço, group = factor(code_cidade), color = factor(Cidade)))+
+  geom_point()+
+  geom_line()+
+  scale_color_manual(values = distinct_colors)+
+  labs(color = "Cidade",
+       title = "Série de preços: REAM - Gasolina A")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ggsave("preços_gas_cidades_ream.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+       dpi = 300)
+```
+
+Em regra os preços covariam no tempo e estão próximos.
+
+Troquemos os valores do eixo y pelas medias no tempo. Aqui está se ignorando as modalidades.
+
+```{r}
+ggplot(data = df_gasolina %>%
+         filter(refinaria == "acelen") %>%
+         group_by(code_cidade) %>%
+         mutate(preco_med = mean(preco)) %>% 
+         rename("Preço Médio" = preco_med,
+                Data = data),
+       aes(x = Data, y = `Preço Médio`, group = factor(code_cidade), color = factor(Cidade)))+
+  geom_point()+
+  geom_line()+
+  scale_color_manual(values = distinct_colors)+
+  labs(color = "Cidade",
+       title = "Preço médio: ACELEN - Gasolina A")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+ggsave("preços_gas_media_acelen.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+       dpi = 300)
+
+```
+
+Façamos o mesmo para PETROBRAS e REAM. 
+
+```{r}
+ggplot(data = df_gasolina %>%
+         filter(refinaria == "petrobras") %>%
+         group_by(code_cidade) %>%
+         mutate(preco_med = mean(preco)) %>% 
+         rename("Preço Médio" = preco_med,
+                Data = data),
+       aes(x = Data, y = `Preço Médio`, group = factor(code_cidade), color = factor(Cidade)))+
+  geom_point()+
+  geom_line()+
+  scale_color_manual(values = distinct_colors)+
+  labs(color = "Cidade",
+       title = "Preço médio: PETROBRAS - Gasolina A")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ggsave("preços_gas_media_petrobras.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+       width = 13, height = 8,
+       dpi = 300)
+
+ggplot(data = df_gasolina %>%
+         filter(refinaria == "ream") %>%
+         group_by(code_cidade) %>%
+         mutate(preco_med = mean(preco)) %>% 
+         rename("Preço Médio" = preco_med,
+                Data = data),
+       aes(x = Data, y = `Preço Médio`, group = factor(code_cidade), color = factor(Cidade)))+
+  geom_point()+
+  geom_line()+
+  scale_color_manual(values = distinct_colors)+
+  labs(color = "Cidade",
+       title = "Preço médio: REAM - Gasolina A")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ggsave("preços_gas_media_ream.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+       dpi = 300)
+```
+
+
+Aqui, existem diferenças superiores a 0,30, mas a disponibilidade de dados é o que mais afeta a diferença de médias apresentada.
+
+Verificando num período onde todos municípios tem dados.
+```{r}
+ggplot(data = df_gasolina %>% filter(refinaria == "acelen", date >= 19692),
+       aes(x = data, y = preco, group = factor(code_cidade), color = factor(code_cidade)))+
+  geom_point()+
+  geom_line()+
+  scale_color_manual(values = distinct_colors)+
+  labs(color = "Cidade")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+Eis as médias.
+```{r}
+ggplot(data = df_gasolina %>%
+         filter(refinaria == "acelen", date >= 19692) %>%
+         group_by(code_cidade) %>%
+         mutate(preco_med = mean(preco)),
+       aes(x = data, y = preco_med, group = factor(code_cidade), color = factor(Cidade)))+
+  geom_point()+
+  geom_line()+
+  scale_color_manual(values = distinct_colors)+
+  labs(color = "Cidade")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ggsave("preços_gas_media_acelen_todos_com_dados.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+       dpi = 300)
+```
+
+Num período onde todos municípios tem dados, a amplitude cai para 0,10.
+
+Tudo é pós operação.
+```{r}
+did1a<- lm(data = df_gasolina %>% 
+             filter(refinaria == "acelen"), # %>%
+             # mutate(code_cidade = relevel(factor(code_cidade), ref = "2929206")),
+           formula = preco ~ factor(data) + factor(code_cidade) + factor(modalidade) - 1)
+
+summary(did1a)
+```
+
+```{r}
+# Os intervalos de confiança
+int<- confint(did1a) %>% as.data.frame()
+
+# Os coeficientes estimados
+int$coef<- did1a$coefficients
+
+# Os nomes das variáveis
+int$var<- row.names(int)
+int$var<- stringr::str_remove(string = int$var, pattern = "factor\\(.*?\\)")
+
+# Selecionando as linhas das variáveis de interesse da regressão
+int$filtro<- grepl(pattern = "[0-9]{7}", x = int$var)
+int<- int %>% filter(filtro == TRUE)
+
+# Trazendo a infromação do nome da cidade
+int2<- df_gasolina[c("code_cidade","Cidade","UF")] %>% unique()
+int2$code_cidade<- as.character(int2$code_cidade)
+names(int2)[1]<- "var"
+
+int<- left_join(x = int, y = int2)
+
+# Nomes dos intervalos de confiança
+names(int)[1:2]<- c("down","top")
+
+# O gráfico
+ggplot(data = int, mapping = aes(x = Cidade, y = coef, color = var == "2929206"))+
+  geom_point()+
+  geom_hline(yintercept = 0, color = "black")+
+  geom_pointrange(mapping = aes(ymin = down, ymax = top))+
+  labs(color = "São Francisco do Conde?")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ ggsave("preços_cidades_acelen_coefs_1_gasolina.png",
+        path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+        dpi = 300)
+```
+
+Destacando os municípios baianos.
+```{r}
+int$BA<- int$UF == 29
+
+# O gráfico
+ggplot(mapping = aes(x = Cidade, y = coef, color = BA))+
+  geom_point(data = int)+
+  geom_hline(data = int, yintercept = 0, color = "black")+
+  geom_pointrange(data = int, mapping = aes(ymin = down, ymax = top))+
+  geom_hline(data = int %>% group_by(BA) %>% summarise(coef = mean(coef)), 
+             mapping = aes(yintercept = coef, color = BA))+
+  labs(color = "Bahia?")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ ggsave("preços_cidades_acelen_coefs_2_gasolina.png", 
+        path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+        dpi = 300)
+```
+
+Essa média de coeficientes tem de ser considerada com imensas resalvas. Serve apenas pra ratificar o que a imagem já indica: que os nível de preços praticados na Bahia não são necessariamente maiores que os demais.
+
+Tudo é pós operação.
+```{r}
+did1a<- lm(data = df_gasolina %>% 
+             filter(refinaria == "acelen"), # %>%
+             # mutate(code_cidade = relevel(factor(code_cidade), ref = "2929206")),
+           formula = preco ~ factor(data) + factor(UF) + factor(modalidade) - 1)
+
+summary(did1a)
+```
+
+```{r}
+# Os intervalos de confiança
+int<- confint(did1a) %>% as.data.frame()
+
+# Os coeficientes estimados
+int$coef<- did1a$coefficients
+
+# Os nomes das variáveis
+int$var<- row.names(int)
+int$var<- stringr::str_remove(string = int$var, pattern = "factor\\(.*?\\)")
+
+# Selecionando as linhas das variáveis de interesse da regressão
+int$filtro<- grepl(pattern = "^[0-9]{2}$", x = int$var)
+int<- int %>% filter(filtro == TRUE)
+
+# Nomes dos intervalos de confiança
+names(int)[1:2]<- c("down","top")
+
+# Destacando a bahia
+int$BA<- int$var == 29
+
+# Sigla das UFs
+vetor<- c(
+"12",	"AC",	"Acre",
+"27",	"AL",	"Alagoas",
+"13",	"AM",	"Amazonas",
+"16",	"AP",	"Amapá",
+"29",	"BA",	"Bahia",
+"23",	"CE",	"Ceará",
+"53",	"DF",	"Distrito Federal",
+"32",	"ES",	"Espírito Santo",
+"52",	"GO",	"Goiás",
+"21",	"MA",	"Maranhão",
+"31",	"MG",	"Minas Gerais",
+"50",	"MS",	"Mato Grosso do Sul",
+"51",	"MT",	"Mato Grosso",
+"15",	"PA",	"Pará",
+"25",	"PB",	"Paraíba",
+"26",	"PE",	"Pernambuco",
+"22",	"PI",	"Piauí",
+"41",	"PR",	"Paraná",
+"33",	"RJ",	"Rio de Janeiro",
+"24",	"RN",	"Rio Grande do Norte",
+"11",	"RO",	"Rondônia",
+"14",	"RR",	"Roraima",
+"43",	"RS",	"Rio Grande do Sul",
+"42",	"SC",	"Santa Catarina",
+"28",	"SE",	"Sergipe",
+"35",	"SP",	"São Paulo",
+"17",	"TO",	"Tocantins")
+
+# Consolidando o dataframe
+tab<- matrix(data = vetor, ncol = 3, byrow = TRUE) %>% as.data.frame()
+names(tab)<- c("var", "Sigla", "Estado")
+
+int<- left_join(x = int, y = tab)
+
+# O gráfico
+ggplot(data = int, mapping = aes(x = Sigla, y = coef, color = BA))+
+  geom_point()+
+  geom_hline(yintercept = 0, color = "black")+
+  geom_pointrange(mapping = aes(ymin = down, ymax = top))+
+  labs(color = "Bahia?")+
+  theme_bw()
+
+ ggsave("preços_cidades_acelen_coefs_3_gasolina.png", 
+        path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+        dpi = 300)
+```
+
+Essa média de coeficientes tem de ser considerada com imensas resalvas. Serve apenas pra ratificar o que a imagem já indica: que os nível de preços praticados na Bahia não são necessariamente maiores que os demais.
+
+## 4.2 Diesel
+
+Dados carregados no código anterior.
+
+Eis os preços das cidades atendidas pela Acelen (os filtros de municipios foram aplicadados).
+```{r}
+df_diesel %>% filter(refinaria == "acelen") %>% 
+  rename(Preço = preco,
+         Data = data) %>% 
+  ggplot(aes(x = Data, y = Preço, group = factor(code_cidade), color = factor(Cidade)))+
+  geom_point()+
+  geom_line()+
+  scale_color_manual(values = distinct_colors)+
+  labs(color = "Cidade",
+       title = "Série de preços: ACELEN - Diesel S10")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ggsave("preços_die_cidades_acelen.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens")
+```
+
+Façamos também para PETROBRAS e REAM. 
+
+```{r}
+# petrobras
+df_diesel %>% filter(refinaria == "petrobras") %>% 
+  rename(Preço = preco,
+         Data = data) %>% 
+  ggplot(aes(x = Data, y = Preço, group = factor(code_cidade), color = factor(Cidade)))+
+  geom_point()+
+  geom_line()+
+  scale_color_manual(values = distinct_colors)+
+  labs(color = "Cidade",
+       title = "Série de preços: PETROBRAS - Diesel S10")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ggsave("preços_die_cidades_petrobras.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+       width = 10, height = 8,
+       units = "in",dpi = 320)
+# ream
+df_diesel %>% filter(refinaria == "ream") %>% 
+  rename(Preço = preco,
+         Data = data) %>% 
+  ggplot(aes(x = Data, y = Preço, group = factor(code_cidade), color = factor(Cidade)))+
+  geom_point()+
+  geom_line()+
+  scale_color_manual(values = distinct_colors)+
+  labs(color = "Cidade",
+       title = "Série de preços: REAM - Diesel S10")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ggsave("preços_die_cidades_ream.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+       dpi = 300)
+```
+
+Em regra os preços covariam no tempo e estão próximos.
+
+Troquemos os valores do eixo y pelas medias no tempo. Aqui está se ignorando as modalidades.
+
+```{r}
+ggplot(data = df_diesel %>%
+         filter(refinaria == "acelen") %>%
+         group_by(code_cidade) %>%
+         mutate(preco_med = mean(preco)) %>% 
+         rename("Preço Médio" = preco_med,
+                Data = data),
+       aes(x = Data, y = `Preço Médio`, group = factor(code_cidade), color = factor(Cidade)))+
+  geom_point()+
+  geom_line()+
+  scale_color_manual(values = distinct_colors)+
+  labs(color = "Cidade",
+       title = "Preço médio: ACELEN - Diesel S10")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ggsave("preços_die_media_acelen.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+       dpi = 300)
+```
+
+Façamos o mesmo para PETROBRAS e REAM. 
+
+```{r}
+ggplot(data = df_diesel %>%
+         filter(refinaria == "petrobras") %>%
+         group_by(code_cidade) %>%
+         mutate(preco_med = mean(preco)) %>% 
+         rename("Preço Médio" = preco_med,
+                Data = data),
+       aes(x = Data, y = `Preço Médio`, group = factor(code_cidade), color = factor(Cidade)))+
+  geom_point()+
+  geom_line()+
+  scale_color_manual(values = distinct_colors)+
+  labs(color = "Cidade",
+       title = "Preço médio: PETROBRAS - Diesel S10")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ggsave("preços_die_media_petrobras.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+       width = 13, height = 8,
+       dpi = 300)
+
+ggplot(data = df_diesel %>%
+         filter(refinaria == "ream") %>%
+         group_by(code_cidade) %>%
+         mutate(preco_med = mean(preco)) %>% 
+         rename("Preço Médio" = preco_med,
+                Data = data),
+       aes(x = Data, y = `Preço Médio`, group = factor(code_cidade), color = factor(Cidade)))+
+  geom_point()+
+  geom_line()+
+  scale_color_manual(values = distinct_colors)+
+  labs(color = "Cidade",
+       title = "Preço médio: REAM - Diesel S10")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ggsave("preços_die_media_ream.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+       dpi = 300)
+```
+
+
+Aqui, existem diferenças superiores a 0,30, mas a disponibilidade de dados é o que mais afeta a diferença de médias apresentada.
+
+Verificando num período onde todos municípios tem dados.
+```{r}
+ggplot(data = df_diesel %>% filter(refinaria == "acelen", date >= 19692),
+       aes(x = data, y = preco, group = factor(code_cidade), color = factor(code_cidade)))+
+  geom_point()+
+  geom_line()+
+  labs(color = "Cidade")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+Eis as médias.
+```{r}
+ggplot(data = df_diesel %>%
+         filter(refinaria == "acelen", date >= 19692) %>%
+         group_by(code_cidade) %>%
+         mutate(preco_med = mean(preco)),
+       aes(x = data, y = preco_med, group = factor(code_cidade), color = factor(Cidade)))+
+  geom_point()+
+  geom_line()+
+   scale_color_manual(values = distinct_colors)+
+  labs(color = "Cidade")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ggsave("preços_die_media_acelen_todos_com_dados.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+       dpi = 300)
+```
+
+Num período onde todos municípios tem dados, a amplitude cai para 0,10.
+
+Tudo é pós operação.
+```{r}
+did1a<- lm(data = df_diesel %>% 
+             filter(refinaria == "acelen"), # %>%
+             # mutate(code_cidade = relevel(factor(code_cidade), ref = "2929206")),
+           formula = preco ~ factor(data) + factor(code_cidade) + factor(modalidade) - 1)
+
+summary(did1a)
+```
+
+```{r}
+# Os intervalos de confiança
+int<- confint(did1a) %>% as.data.frame()
+
+# Os coeficientes estimados
+int$coef<- did1a$coefficients
+
+# Os nomes das variáveis
+int$var<- row.names(int)
+int$var<- stringr::str_remove(string = int$var, pattern = "factor\\(.*?\\)")
+
+# Selecionando as linhas das variáveis de interesse da regressão
+int$filtro<- grepl(pattern = "[0-9]{7}", x = int$var)
+int<- int %>% filter(filtro == TRUE)
+
+# Trazendo a infromação do nome da cidade
+int2<- df_gasolina[c("code_cidade","Cidade","UF")] %>% unique()
+int2$code_cidade<- as.character(int2$code_cidade)
+names(int2)[1]<- "var"
+
+int<- left_join(x = int, y = int2)
+
+# Nomes dos intervalos de confiança
+names(int)[1:2]<- c("down","top")
+
+# O gráfico
+ggplot(data = int, mapping = aes(x = Cidade, y = coef, color = var == "2929206"))+
+  geom_point()+
+  geom_hline(yintercept = 0, color = "black")+
+  geom_pointrange(mapping = aes(ymin = down, ymax = top))+
+  labs(color = "São Francisco do Conde?")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ggsave("preços_cidades_acelen_coefs_1_diesel.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+       dpi = 300)
+```
+
+Destacando os municípios baianos.
+```{r}
+int$BA<- int$UF == 29
+
+# O gráfico
+ggplot(mapping = aes(x = Cidade, y = coef, color = BA))+
+  geom_point(data = int)+
+  geom_hline(data = int, yintercept = 0, color = "black")+
+  geom_pointrange(data = int, mapping = aes(ymin = down, ymax = top))+
+  geom_hline(data = int %>% group_by(BA) %>% summarise(coef = mean(coef)), 
+             mapping = aes(yintercept = coef, color = BA))+
+  labs(color = "Bahia?")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+ggsave("preços_cidades_acelen_coefs_2_diesel.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+       dpi = 300)
+```
+
+Essa média de coeficientes tem de ser considerada com imensas resalvas. Serve apenas pra ratificar o que a imagem já indica: que os nível de preços praticados na Bahia não são necessariamente maiores que os demais.
+
+Tudo é pós operação.
+```{r}
+did1a<- lm(data = df_diesel %>% 
+             filter(refinaria == "acelen"), # %>%
+             # mutate(code_cidade = relevel(factor(code_cidade), ref = "2929206")),
+           formula = preco ~ factor(data) + factor(UF) + factor(modalidade) - 1)
+
+summary(did1a)
+```
+
+```{r}
+# Os intervalos de confiança
+int<- confint(did1a) %>% as.data.frame()
+
+# Os coeficientes estimados
+int$coef<- did1a$coefficients
+
+# Os nomes das variáveis
+int$var<- row.names(int)
+int$var<- stringr::str_remove(string = int$var, pattern = "factor\\(.*?\\)")
+
+# Selecionando as linhas das variáveis de interesse da regressão
+int$filtro<- grepl(pattern = "^[0-9]{2}$", x = int$var)
+int<- int %>% filter(filtro == TRUE)
+
+# Nomes dos intervalos de confiança
+names(int)[1:2]<- c("down","top")
+
+# Destacando a bahia
+int$BA<- int$var == 29
+
+# Sigla das UFs
+vetor<- c(
+"12",	"AC",	"Acre",
+"27",	"AL",	"Alagoas",
+"13",	"AM",	"Amazonas",
+"16",	"AP",	"Amapá",
+"29",	"BA",	"Bahia",
+"23",	"CE",	"Ceará",
+"53",	"DF",	"Distrito Federal",
+"32",	"ES",	"Espírito Santo",
+"52",	"GO",	"Goiás",
+"21",	"MA",	"Maranhão",
+"31",	"MG",	"Minas Gerais",
+"50",	"MS",	"Mato Grosso do Sul",
+"51",	"MT",	"Mato Grosso",
+"15",	"PA",	"Pará",
+"25",	"PB",	"Paraíba",
+"26",	"PE",	"Pernambuco",
+"22",	"PI",	"Piauí",
+"41",	"PR",	"Paraná",
+"33",	"RJ",	"Rio de Janeiro",
+"24",	"RN",	"Rio Grande do Norte",
+"11",	"RO",	"Rondônia",
+"14",	"RR",	"Roraima",
+"43",	"RS",	"Rio Grande do Sul",
+"42",	"SC",	"Santa Catarina",
+"28",	"SE",	"Sergipe",
+"35",	"SP",	"São Paulo",
+"17",	"TO",	"Tocantins")
+
+# Consolidando o dataframe
+tab<- matrix(data = vetor, ncol = 3, byrow = TRUE) %>% as.data.frame()
+names(tab)<- c("var", "Sigla", "Estado")
+
+int<- left_join(x = int, y = tab)
+
+# O gráfico
+ggplot(data = int, mapping = aes(x = Sigla, y = coef, color = BA))+
+  geom_point()+
+  geom_hline(yintercept = 0, color = "black")+
+  geom_pointrange(mapping = aes(ymin = down, ymax = top))+
+  labs(color = "Bahia?")+
+  theme_bw()
+
+ggsave("preços_cidades_acelen_coefs_3_diesel.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+       dpi = 300)
+```
+
+Essa média de coeficientes tem de ser considerada com imensas resalvas. Serve apenas pra ratificar o que a imagem já indica: que os nível de preços praticados na Bahia não são necessariamente maiores que os demais.

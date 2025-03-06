@@ -1405,9 +1405,21 @@ rm(list = ls())
 
 Avaliar o aumento de preço por si só NÃO é o mesmo que avaliar uma conduta.
 
+Informações dos estados:
+```{r}
+tab <- geobr::read_state(showProgress = F, year = 2020) %>% as_tibble() %>% 
+  mutate(code_state = as.character(code_state)) %>% 
+  select(code_state, abbrev_state, name_region)
+```
+
 Carregando os dados MENSAIS:
 ```{r}
 df_combustivel <- readRDS(file = "S:/CECAN/Felipe Raposo/Refino/Bases/preco_combustiveis_mensal.rds")
+# deflacionando
+df_combustivel$preco_def <- deflateBR::ipca(df_combustivel$preco, as.Date(df_combustivel$date), "07/2024")
+
+df_combustivel <- df_combustivel %>% 
+  left_join(tab, by = join_by("UF" == "code_state"))
 ```
 
 Excluindo a intervenção em Janeiro de 2021.
@@ -1532,13 +1544,118 @@ distinct_colors <- c(
 Dados carregados no código anterior.
 
 Eis os preços das cidades atendidas pela Acelen (os filtros de municipios foram aplicadados).
+
+```{r}
+sumario_preco <- df_gasolina %>% 
+  filter(!is.na(preco_def), 
+         UF %in% c(29, 13), 
+         as.Date(date) < "2021-12-01") %>% 
+  summarise(n = n(),
+            Mean = mean(preco_def),
+            `Std. Dev` = sd(preco_def), 
+            Min = min(preco_def), 
+            Max = max(preco_def),
+            .by = c(abbrev_state)) %>% 
+  mutate(date = "< 12/2021") %>% 
+  rbind(df_gasolina %>% 
+      filter(!is.na(preco_def), 
+             UF %in% c(29, 13), 
+             (as.Date(date) >= "2021-12-01" & as.Date(date) < "2022-12-01")) %>% 
+      summarise(n = n(),
+                Mean = mean(preco_def),
+                `Std. Dev` = sd(preco_def), 
+                Min = min(preco_def), 
+                Max = max(preco_def),
+                .by = c(abbrev_state)) %>% 
+      mutate(date = "12/2021 - 11/2022")) %>% 
+  rbind(df_gasolina %>% 
+      filter(!is.na(preco_def), 
+             UF %in% c(29, 13), 
+             (as.Date(date) >= "2022-12-01" & as.Date(date) < "2023-12-01")) %>% 
+      summarise(n = n(),
+                Mean = mean(preco_def),
+                `Std. Dev` = sd(preco_def), 
+                Min = min(preco_def), 
+                Max = max(preco_def),
+                .by = c(abbrev_state)) %>% 
+      mutate(date = "12/2022 - 11/2023")) %>% 
+  arrange(date) %>% 
+  mutate(Produto = "Gasolina A")
+```
+
+
+```{r}
+df_gasolina %>% 
+  filter(Cidade %in% c("Betim", "São Francisco Do Conde"), !is.na(preco)) %>% 
+  mutate(Cidade = paste(Cidade, abbrev_state, sep = " - ")) %>% 
+  ggplot(aes(x = data, y = preco, group = factor(Cidade), color = factor(Cidade)))+
+  geom_point(group = "refinaria")+
+  geom_line()+
+  geom_vline(xintercept = "2021-12", linetype = 2, colour = "black")+
+  labs(color = "Cidade")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+
+ggsave("comparacao_preços_gas.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens")
+```
+
+Preço médio dos grupos de tratamento-controle, levando em conta a refinaria
+
+```{r}
+# quais os coortes da gasolina
+coorte_gas <- df_gasolina %>% 
+  filter(!is.na(preco), 
+         priv == 1) %>% 
+  group_by(code_cidade) %>% 
+  summarise(data_coorte = min(date)) %>% 
+  ungroup() %>% 
+  reframe(.by = data_coorte) %>% 
+  mutate(data_coorte = as.Date(data_coorte), 
+         data_coorte = stringr::str_sub(data_coorte, 1, 7))
+
+# REAM 
+ggplot(data = df_gasolina %>% 
+         filter(!is.na(preco)) %>% 
+         group_by(code_cidade) %>% 
+         mutate(trat = if_else(sum(priv) >= 1, T, F)) %>% 
+         ungroup() %>% 
+         filter((trat == 0)|(trat == 1 & UF == "13")) %>% 
+         summarise(preco_med = mean(preco_def), .by = c("trat","data")),
+           aes(x = data, y = preco_med, group = factor(trat), color = factor(trat)))+
+  geom_point()+
+  geom_line()+
+  labs(color = "Tratamento?")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))+
+  geom_vline(data = coorte_gas %>% filter(data_coorte == "2022-12"), aes(xintercept = data_coorte), linetype = 2)
+
+# ACELEN
+ggplot(data = df_gasolina %>% 
+         filter(!is.na(preco)) %>% 
+         group_by(code_cidade) %>% 
+         mutate(trat = if_else(sum(priv) >= 1, T, F)) %>% 
+         ungroup() %>% 
+         filter((trat == 0)|(trat == 1 & UF != "13")) %>% 
+         summarise(preco_med = mean(preco_def), .by = c("trat","data")),
+           aes(x = data, y = preco_med, group = factor(trat), color = factor(trat)))+
+  geom_point()+
+  geom_line()+
+  theme_bw()+
+  labs(color = "Tratamento?")+
+  theme(axis.text.x = element_text(angle = 90))+
+  geom_vline(data = coorte_gas, aes(xintercept = data_coorte), linetype = 2)
+```
+
 ```{r}
 df_gasolina %>% filter(refinaria == "acelen") %>% 
   rename(Preço = preco,
          Data = data) %>% 
+  mutate(Cidade = paste(Cidade, abbrev_state, sep = " - ")) %>% 
   ggplot(aes(x = Data, y = Preço, group = factor(code_cidade), color = factor(Cidade)))+
   geom_point()+
-  geom_line()+
+  # geom_line()+
   scale_color_manual(values = distinct_colors)+
   labs(color = "Cidade",
        title = "Série de preços: ACELEN - Gasolina A")+
@@ -1553,15 +1670,17 @@ Façamos também para PETROBRAS e REAM.
 
 ```{r}
 # petrobras
-df_gasolina %>% filter(refinaria == "petrobras") %>% 
+df_gasolina %>% 
+  filter(refinaria == "petrobras") %>% 
   rename(Preço = preco,
          Data = data) %>% 
+  mutate(Cidade = paste(Cidade, abbrev_state, sep = " - ")) %>% 
   ggplot(aes(x = Data, y = Preço, group = factor(code_cidade), color = factor(Cidade)))+
   geom_point()+
-  geom_line()+
+  # geom_line()+
   scale_color_manual(values = distinct_colors)+
   labs(color = "Cidade",
-       title = "Série de preços: PETROBRAS - Gasolina A")+
+       title = "Preços: PETROBRAS - Gasolina A")+
   theme_bw()+
   theme(axis.text.x = element_text(angle = 90))
 
@@ -1573,12 +1692,13 @@ ggsave("preços_gas_cidades_petrobras.png",
 df_gasolina %>% filter(refinaria == "ream") %>% 
   rename(Preço = preco,
          Data = data) %>% 
+  mutate(Cidade = paste(Cidade, abbrev_state, sep = " - ")) %>%  
   ggplot(aes(x = Data, y = Preço, group = factor(code_cidade), color = factor(Cidade)))+
   geom_point()+
-  geom_line()+
+  # geom_line()+
   scale_color_manual(values = distinct_colors)+
   labs(color = "Cidade",
-       title = "Série de preços: REAM - Gasolina A")+
+       title = "Preços: REAM - Gasolina A")+
   theme_bw()+
   theme(axis.text.x = element_text(angle = 90))
 
@@ -1592,69 +1712,101 @@ Em regra os preços covariam no tempo e estão próximos.
 Troquemos os valores do eixo y pelas medias no tempo. Aqui está se ignorando as modalidades.
 
 ```{r}
-ggplot(data = df_gasolina %>%
-         filter(refinaria == "acelen") %>%
-         group_by(code_cidade) %>%
-         mutate(preco_med = mean(preco)) %>% 
-         rename("Preço Médio" = preco_med,
-                Data = data),
-       aes(x = Data, y = `Preço Médio`, group = factor(code_cidade), color = factor(Cidade)))+
-  geom_point()+
-  geom_line()+
-  scale_color_manual(values = distinct_colors)+
-  labs(color = "Cidade",
-       title = "Preço médio: ACELEN - Gasolina A")+
-  theme_bw()+
-  theme(axis.text.x = element_text(angle = 90))
-ggsave("preços_gas_media_acelen.png", 
-       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
-       dpi = 300)
+# ggplot(data = df_gasolina %>%
+#          filter(refinaria == "acelen") %>%
+#          group_by(code_cidade) %>%
+#          mutate(preco_med = mean(preco)) %>%
+#          rename("Preço Médio" = preco_med,
+#                 Data = data) %>%
+#          ungroup() %>%
+#          mutate(Cidade = paste(Cidade, abbrev_state, sep = " - ")),
+#        aes(x = Data, y = `Preço Médio`, group = factor(code_cidade), color = factor(Cidade)))+
+#   geom_point()+
+#   geom_line()+
+#   scale_color_manual(values = distinct_colors)+
+#   labs(color = "Cidade",
+#        title = "Preço médio: ACELEN - Gasolina A")+
+#   theme_bw()+
+#   theme(axis.text.x = element_text(angle = 90))
+# ggsave("preços_gas_media_acelen.png",
+#        path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+#        dpi = 300)
 
+```
+
+```{r}
+df_gasolina %>%
+  mutate(Cidade = paste(Cidade, abbrev_state, sep = " - ")) %>% 
+         filter(refinaria == "acelen") %>%
+         group_by(Cidade) %>%
+         reframe("Preço Médio" = round(mean(preco_def), 2)) %>% 
+  kableExtra::kbl(centering = T, 
+                  align = c("l", "c")) %>%
+  kableExtra::kable_classic_2(full_width = F, html_font = "Calibri")
 ```
 
 Façamos o mesmo para PETROBRAS e REAM. 
 
 ```{r}
-ggplot(data = df_gasolina %>%
-         filter(refinaria == "petrobras") %>%
-         group_by(code_cidade) %>%
-         mutate(preco_med = mean(preco)) %>% 
-         rename("Preço Médio" = preco_med,
-                Data = data),
-       aes(x = Data, y = `Preço Médio`, group = factor(code_cidade), color = factor(Cidade)))+
-  geom_point()+
-  geom_line()+
-  scale_color_manual(values = distinct_colors)+
-  labs(color = "Cidade",
-       title = "Preço médio: PETROBRAS - Gasolina A")+
-  theme_bw()+
-  theme(axis.text.x = element_text(angle = 90))
-
-ggsave("preços_gas_media_petrobras.png", 
-       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
-       width = 13, height = 8,
-       dpi = 300)
-
-ggplot(data = df_gasolina %>%
-         filter(refinaria == "ream") %>%
-         group_by(code_cidade) %>%
-         mutate(preco_med = mean(preco)) %>% 
-         rename("Preço Médio" = preco_med,
-                Data = data),
-       aes(x = Data, y = `Preço Médio`, group = factor(code_cidade), color = factor(Cidade)))+
-  geom_point()+
-  geom_line()+
-  scale_color_manual(values = distinct_colors)+
-  labs(color = "Cidade",
-       title = "Preço médio: REAM - Gasolina A")+
-  theme_bw()+
-  theme(axis.text.x = element_text(angle = 90))
-
-ggsave("preços_gas_media_ream.png", 
-       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
-       dpi = 300)
+# ggplot(data = df_gasolina %>%
+#          filter(refinaria == "petrobras") %>%
+#          group_by(code_cidade) %>%
+#          mutate(preco_med = mean(preco)) %>% 
+#          rename("Preço Médio" = preco_med,
+#                 Data = data) %>% mutate(Cidade = paste(Cidade, abbrev_state, sep = " - ")),
+#        aes(x = Data, y = `Preço Médio`, group = factor(code_cidade), color = factor(Cidade)))+
+#   geom_point()+
+#   geom_line()+
+#   scale_color_manual(values = distinct_colors)+
+#   labs(color = "Cidade",
+#        title = "Preço médio: PETROBRAS - Gasolina A")+
+#   theme_bw()+
+#   theme(axis.text.x = element_text(angle = 90))
+# 
+# ggsave("preços_gas_media_petrobras.png", 
+#        path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+#        width = 13, height = 8,
+#        dpi = 300)
+# 
+# ggplot(data = df_gasolina %>%
+#          filter(refinaria == "ream") %>%
+#          group_by(code_cidade) %>%
+#          mutate(preco_med = mean(preco)) %>% 
+#          rename("Preço Médio" = preco_med,
+#                 Data = data) %>% mutate(Cidade = paste(Cidade, abbrev_state, sep = " - ")),
+#        aes(x = Data, y = `Preço Médio`, group = factor(code_cidade), color = factor(Cidade)))+
+#   geom_point()+
+#   geom_line()+
+#   scale_color_manual(values = distinct_colors)+
+#   labs(color = "Cidade",
+#        title = "Preço médio: REAM - Gasolina A")+
+#   theme_bw()+
+#   theme(axis.text.x = element_text(angle = 90))
+# 
+# ggsave("preços_gas_media_ream.png", 
+#        path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+#        dpi = 300)
 ```
 
+```{r}
+df_gasolina %>%
+  mutate(Cidade = paste(Cidade, abbrev_state, sep = " - ")) %>% 
+         filter(refinaria == "petrobras") %>%
+         group_by(Cidade) %>%
+         reframe("Preço Médio" = round(mean(preco_def, na.rm = T), 2)) %>% 
+  kableExtra::kbl(centering = T, 
+                  align = c("l", "c")) %>%
+  kableExtra::kable_classic_2(full_width = F, html_font = "Calibri")
+
+df_gasolina %>%
+  mutate(Cidade = paste(Cidade, abbrev_state, sep = " - ")) %>% 
+         filter(refinaria == "ream") %>%
+         group_by(Cidade) %>%
+         reframe("Preço Médio" = round(mean(preco_def), 2)) %>% 
+  kableExtra::kbl(centering = T, 
+                  align = c("l", "c")) %>%
+  kableExtra::kable_classic_2(full_width = F, html_font = "Calibri")
+```
 
 Aqui, existem diferenças superiores a 0,30, mas a disponibilidade de dados é o que mais afeta a diferença de médias apresentada.
 
@@ -1846,16 +1998,78 @@ Essa média de coeficientes tem de ser considerada com imensas resalvas. Serve a
 
 ## 4.2 Diesel
 
+```{r}
+df_diesel %>% 
+  filter(Cidade %in% c("Betim", "São Francisco Do Conde"), !is.na(preco)) %>% 
+  mutate(Cidade = paste(Cidade, abbrev_state, sep = " - ")) %>% 
+  ggplot(aes(x = data, y = preco, group = factor(Cidade), color = factor(Cidade)))+
+  geom_point(group = "refinaria")+
+  geom_line()+
+  geom_vline(xintercept = "2021-12", linetype = 2, colour = "black")+
+  labs(color = "Cidade")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+
+ggsave("comparacao_preços_gas.png", 
+       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens")
+```
+
 Dados carregados no código anterior.
 
 Eis os preços das cidades atendidas pela Acelen (os filtros de municipios foram aplicadados).
+
+```{r}
+sumario_preco <- sumario_preco %>% 
+  rbind((df_diesel %>% 
+  filter(!is.na(preco_def), 
+         UF %in% c(29, 13), 
+         as.Date(date) < "2021-12-01") %>% 
+  summarise(n = n(),
+            Mean = mean(preco_def),
+            `Std. Dev` = sd(preco_def), 
+            Min = min(preco_def), 
+            Max = max(preco_def),
+            .by = c(abbrev_state)) %>% 
+  mutate(date = "< 12/2021")) %>% 
+  rbind(df_diesel %>% 
+      filter(!is.na(preco_def), 
+             UF %in% c(29, 13), 
+             (as.Date(date) >= "2021-12-01" & as.Date(date) < "2022-12-01")) %>% 
+      summarise(n = n(),
+                Mean = mean(preco_def),
+                `Std. Dev` = sd(preco_def), 
+                Min = min(preco_def), 
+                Max = max(preco_def),
+                .by = c(abbrev_state)) %>% 
+      mutate(date = "12/2021 - 11/2022")) %>% 
+  rbind(df_diesel %>% 
+      filter(!is.na(preco_def), 
+             UF %in% c(29, 13), 
+             (as.Date(date) >= "2022-12-01" & as.Date(date) < "2023-12-01")) %>% 
+      summarise(n = n(),
+                Mean = mean(preco_def),
+                `Std. Dev` = sd(preco_def), 
+                Min = min(preco_def), 
+                Max = max(preco_def),
+                .by = c(abbrev_state)) %>% 
+      mutate(date = "12/2022 - 11/2023")) %>%
+  mutate(Produto = "Diesel S10"))
+
+sumario_preco <- sumario_preco %>% 
+  arrange(date)
+
+sumario_preco <- sumario_preco[c(9:12, 1:8),]
+```
+
 ```{r}
 df_diesel %>% filter(refinaria == "acelen") %>% 
   rename(Preço = preco,
          Data = data) %>% 
+  mutate(Cidade = paste(Cidade, abbrev_state, sep = " - ")) %>% 
   ggplot(aes(x = Data, y = Preço, group = factor(code_cidade), color = factor(Cidade)))+
   geom_point()+
-  geom_line()+
+  # geom_line()+
   scale_color_manual(values = distinct_colors)+
   labs(color = "Cidade",
        title = "Série de preços: ACELEN - Diesel S10")+
@@ -1872,10 +2086,11 @@ Façamos também para PETROBRAS e REAM.
 # petrobras
 df_diesel %>% filter(refinaria == "petrobras") %>% 
   rename(Preço = preco,
-         Data = data) %>% 
+         Data = data) %>%
+  mutate(Cidade = paste(Cidade, abbrev_state, sep = " - ")) %>% 
   ggplot(aes(x = Data, y = Preço, group = factor(code_cidade), color = factor(Cidade)))+
   geom_point()+
-  geom_line()+
+  # geom_line()+
   scale_color_manual(values = distinct_colors)+
   labs(color = "Cidade",
        title = "Série de preços: PETROBRAS - Diesel S10")+
@@ -1892,7 +2107,7 @@ df_diesel %>% filter(refinaria == "ream") %>%
          Data = data) %>% 
   ggplot(aes(x = Data, y = Preço, group = factor(code_cidade), color = factor(Cidade)))+
   geom_point()+
-  geom_line()+
+  # geom_line()+
   scale_color_manual(values = distinct_colors)+
   labs(color = "Cidade",
        title = "Série de preços: REAM - Diesel S10")+
@@ -1909,24 +2124,36 @@ Em regra os preços covariam no tempo e estão próximos.
 Troquemos os valores do eixo y pelas medias no tempo. Aqui está se ignorando as modalidades.
 
 ```{r}
-ggplot(data = df_diesel %>%
-         filter(refinaria == "acelen") %>%
-         group_by(code_cidade) %>%
-         mutate(preco_med = mean(preco)) %>% 
-         rename("Preço Médio" = preco_med,
-                Data = data),
-       aes(x = Data, y = `Preço Médio`, group = factor(code_cidade), color = factor(Cidade)))+
-  geom_point()+
-  geom_line()+
-  scale_color_manual(values = distinct_colors)+
-  labs(color = "Cidade",
-       title = "Preço médio: ACELEN - Diesel S10")+
-  theme_bw()+
-  theme(axis.text.x = element_text(angle = 90))
+# ggplot(data = df_diesel %>%
+#          filter(refinaria == "acelen") %>%
+#          group_by(code_cidade) %>%
+#          mutate(preco_med = mean(preco)) %>% 
+#          rename("Preço Médio" = preco_med,
+#                 Data = data) %>% 
+#          mutate(Cidade = paste(Cidade, abbrev_state, sep = " - ")),
+#        aes(x = Data, y = `Preço Médio`, group = factor(code_cidade), color = factor(Cidade)))+
+#   geom_point()+
+#   geom_line()+
+#   scale_color_manual(values = distinct_colors)+
+#   labs(color = "Cidade",
+#        title = "Preço médio: ACELEN - Diesel S10")+
+#   theme_bw()+
+#   theme(axis.text.x = element_text(angle = 90))
+# 
+# ggsave("preços_die_media_acelen.png", 
+#        path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
+#        dpi = 300)
+```
 
-ggsave("preços_die_media_acelen.png", 
-       path = "S:/CECAN/Felipe Raposo/Refino/Sobrepreço/[refino] imagens",
-       dpi = 300)
+```{r}
+df_diesel %>%
+  mutate(Cidade = paste(Cidade, abbrev_state, sep = " - ")) %>% 
+         filter(refinaria == "acelen") %>%
+         group_by(Cidade) %>%
+         reframe("Preço Médio" = round(mean(preco_def), 2)) %>% 
+  kableExtra::kbl(centering = T, 
+                  align = c("l", "c")) %>%
+  kableExtra::kable_classic_2(full_width = F, html_font = "Calibri")
 ```
 
 Façamos o mesmo para PETROBRAS e REAM. 
@@ -1937,7 +2164,8 @@ ggplot(data = df_diesel %>%
          group_by(code_cidade) %>%
          mutate(preco_med = mean(preco)) %>% 
          rename("Preço Médio" = preco_med,
-                Data = data),
+                Data = data) %>% 
+         mutate(Cidade = paste(Cidade, abbrev_state, sep = " - ")),
        aes(x = Data, y = `Preço Médio`, group = factor(code_cidade), color = factor(Cidade)))+
   geom_point()+
   geom_line()+
@@ -2159,3 +2387,17 @@ ggsave("preços_cidades_acelen_coefs_3_diesel.png",
 ```
 
 Essa média de coeficientes tem de ser considerada com imensas resalvas. Serve apenas pra ratificar o que a imagem já indica: que os nível de preços praticados na Bahia não são necessariamente maiores que os demais.
+
+
+```{r}
+sumario_preco %>% 
+  mutate(across(3:6, ~ round(.x, 2))) %>% 
+  select(abbrev_state, Produto, date, everything()) %>% 
+  rename(Estado = abbrev_state, 
+         N = n, 
+         Data = date) %>% 
+  kableExtra::kbl(centering = T, 
+                  align = rep("c", 7)) %>%
+  kableExtra::kable_classic_2(full_width = F, html_font = "Calibri") %>%
+  kableExtra::row_spec(seq(4, nrow(sumario_preco), 4), extra_css = "border-bottom: 1px solid;") 
+```

@@ -14,3 +14,5 @@ Créditos e agradecimentos a:
   Fernado Franke - Coordenador da CECAN (Coordenação de Estudos de Condutas Anticompetitivas)
   
   João Isídio Freitas Martins - Economista da CECAN 
+
+15/12/2024
